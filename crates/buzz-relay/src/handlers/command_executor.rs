@@ -878,7 +878,7 @@ async fn handle_workflow_trigger(
     // Persist the command event under the workflow channel even though the
     // trigger event itself only carries the workflow UUID. Storing channel
     // triggers as global events leaks workflow IDs to unrelated relay members.
-    let tx = match persist_command_event(&state.db, tenant, event, workflow.channel_id).await? {
+    let mut tx = match persist_command_event(&state.db, tenant, event, workflow.channel_id).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -909,21 +909,27 @@ async fn handle_workflow_trigger(
             }
         }
     }
-    let trigger_ctx_json = serde_json::to_value(&trigger_ctx).ok();
+    let trigger_ctx_json = buzz_workflow::snapshot::InitialExecutionSnapshot::capture(
+        workflow_id,
+        wf_channel_id,
+        &workflow.owner_pubkey,
+        &def,
+        &trigger_ctx,
+    )
+    .map_err(|e| IngestError::Internal(format!("error: initial snapshot: {e}")))?;
 
     let event_id_bytes = event.id.as_bytes().to_vec();
-    let run_id = state
-        .db
-        .create_workflow_run(
-            community_id,
-            workflow_id,
-            Some(&event_id_bytes),
-            trigger_ctx_json.as_ref(),
-        )
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
+    let run_id = buzz_db::workflow::create_workflow_run(
+        &mut *tx,
+        community_id,
+        workflow_id,
+        Some(&event_id_bytes),
+        Some(&trigger_ctx_json),
+    )
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
 
-    // Finalize the idempotency record after the separate run creation succeeds.
+    // Signed command, original snapshot and Pending run share one commit.
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;

@@ -4,6 +4,142 @@
 use crate::{executor::TriggerContext, schema::ActionDef, WorkflowDef, WorkflowError};
 use serde::{Deserialize, Serialize};
 
+/// Immutable original dispatch inputs. Distinct from an approval-gate snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialExecutionSnapshot {
+    /// Workflow whose Pending row stores this snapshot.
+    pub workflow_id: uuid::Uuid,
+    /// Original channel scope, also bound to the trigger.
+    pub channel_id: uuid::Uuid,
+    /// Original owner identity; recovery must also verify current authority.
+    pub owner_pubkey: String,
+    /// Exact original definition, not the latest editable record.
+    pub definition: WorkflowDef,
+    /// Original typed inputs, including manual/webhook fields.
+    pub trigger: TriggerContext,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredInitialSnapshot {
+    buzz_execution_version: u8,
+    initial: InitialExecutionSnapshot,
+}
+
+impl InitialExecutionSnapshot {
+    /// Validate and serialize original inputs before run creation.
+    pub fn capture(
+        workflow_id: uuid::Uuid,
+        channel_id: uuid::Uuid,
+        owner: &[u8],
+        definition: &WorkflowDef,
+        trigger: &TriggerContext,
+    ) -> Result<serde_json::Value, WorkflowError> {
+        let initial = Self {
+            workflow_id,
+            channel_id,
+            owner_pubkey: hex::encode(owner),
+            definition: definition.clone(),
+            trigger: trigger.clone(),
+        };
+        initial.validate()?;
+        serde_json::to_value(StoredInitialSnapshot {
+            buzz_execution_version: 2,
+            initial,
+        })
+        .map_err(|e| {
+            WorkflowError::InvalidDefinition(format!("initial snapshot serialization: {e}"))
+        })
+    }
+
+    fn validate(&self) -> Result<(), WorkflowError> {
+        self.definition.validate()?;
+        if self.owner_pubkey.len() != 64
+            || !self
+                .owner_pubkey
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.trigger.channel_id != self.channel_id.to_string()
+        {
+            return Err(WorkflowError::InvalidDefinition(
+                "initial snapshot scope mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Strictly decode the initial version; never infer legacy/default inputs.
+    pub fn from_stored(value: &serde_json::Value) -> Result<Self, WorkflowError> {
+        let stored: StoredInitialSnapshot =
+            serde_json::from_value(value.clone()).map_err(|_| {
+                WorkflowError::InvalidDefinition("missing or invalid initial snapshot".into())
+            })?;
+        if stored.buzz_execution_version != 2 {
+            return Err(WorkflowError::InvalidDefinition(
+                "unsupported initial snapshot version".into(),
+            ));
+        }
+        stored.initial.validate()?;
+        Ok(stored.initial)
+    }
+}
+
+#[cfg(test)]
+mod initial_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn initial_snapshot_pins_definition_inputs_and_scope() {
+        let workflow = uuid::Uuid::new_v4();
+        let channel = uuid::Uuid::new_v4();
+        let (mut definition, _) = crate::schema::parse_yaml("name: original\ntrigger:\n  on: message_posted\nsteps:\n  - id: gate\n    action: request_approval\n    from: any\n    message: original question\n").unwrap();
+        let mut trigger = TriggerContext {
+            channel_id: channel.to_string(),
+            text: "original input".into(),
+            ..Default::default()
+        };
+        trigger
+            .webhook_fields
+            .insert("scope".into(), "original scope".into());
+        let stored =
+            InitialExecutionSnapshot::capture(workflow, channel, &[7; 32], &definition, &trigger)
+                .unwrap();
+        definition.name = "later edit".into();
+        trigger.text = "later input".into();
+        let restored = InitialExecutionSnapshot::from_stored(&stored).unwrap();
+        assert_eq!(restored.definition.name, "original");
+        assert_eq!(restored.trigger.text, "original input");
+        assert_eq!(restored.trigger.webhook_fields["scope"], "original scope");
+        assert_eq!(restored.workflow_id, workflow);
+        assert_eq!(restored.channel_id, channel);
+        assert_eq!(restored.owner_pubkey, hex::encode([7; 32]));
+        assert!(ExecutionSnapshot::from_stored(&stored).is_err());
+        for invalid in [
+            json!({}),
+            json!({"text":"legacy"}),
+            json!({"buzz_execution_version":1,"snapshot":{}}),
+        ] {
+            assert!(InitialExecutionSnapshot::from_stored(&invalid).is_err());
+        }
+        for (path, value) in [
+            ("owner_pubkey", json!("")),
+            ("channel_id", json!(uuid::Uuid::new_v4())),
+        ] {
+            let mut invalid = stored.clone();
+            invalid["initial"][path] = value;
+            assert!(InitialExecutionSnapshot::from_stored(&invalid).is_err());
+        }
+        let mut invalid = stored.clone();
+        invalid["buzz_execution_version"] = json!(3);
+        assert!(InitialExecutionSnapshot::from_stored(&invalid).is_err());
+        let mut invalid = stored;
+        invalid["extra"] = json!(true);
+        assert!(InitialExecutionSnapshot::from_stored(&invalid).is_err());
+    }
+}
+
 /// Resolved approval fields, bound to the suspended definition's step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -815,13 +815,16 @@ pub async fn claim_workflow_start(
 }
 
 /// Insert a new run with its original serialized trigger context.
-pub async fn create_workflow_run(
-    pool: &PgPool,
+pub async fn create_workflow_run<'e, E>(
+    executor: E,
     community_id: CommunityId,
     workflow_id: Uuid,
     trigger_event_id: Option<&[u8]>,
     trigger_context: Option<&serde_json::Value>,
-) -> Result<Uuid> {
+) -> Result<Uuid>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let id = Uuid::new_v4();
 
     sqlx::query(
@@ -836,7 +839,7 @@ pub async fn create_workflow_run(
     .bind(workflow_id)
     .bind(trigger_event_id)
     .bind(trigger_context)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(id)
@@ -3651,6 +3654,43 @@ mod postgres_tests {
             assert_eq!(preserved.execution_trace, trace);
             assert_eq!(preserved.trigger_context, Some(context.clone()));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn workflow_run_creation_joins_caller_transaction() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow = Uuid::new_v4();
+        insert_workflow_with_ids(
+            &pool,
+            community,
+            workflow,
+            Uuid::new_v4(),
+            "transactional-start",
+        )
+        .await;
+        let snapshot =
+            serde_json::json!({"buzz_execution_version":2,"initial":{"marker":"original"}});
+        let mut tx = pool.begin().await.unwrap();
+        let rolled_back = create_workflow_run(&mut *tx, community, workflow, None, Some(&snapshot))
+            .await
+            .unwrap();
+        assert!(get_workflow_run(&pool, community, rolled_back)
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+        assert!(get_workflow_run(&pool, community, rolled_back)
+            .await
+            .is_err());
+        let mut tx = pool.begin().await.unwrap();
+        let committed = create_workflow_run(&mut *tx, community, workflow, None, Some(&snapshot))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let run = get_workflow_run(&pool, community, committed).await.unwrap();
+        assert_eq!(run.status, RunStatus::Pending);
+        assert_eq!(run.trigger_context, Some(snapshot));
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------

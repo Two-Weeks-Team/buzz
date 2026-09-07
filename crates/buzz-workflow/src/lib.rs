@@ -357,14 +357,6 @@ impl WorkflowEngine {
 
         let trigger_ctx = build_trigger_context(event);
 
-        let trigger_ctx_json: serde_json::Value = match serde_json::to_value(&trigger_ctx) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Failed to serialize trigger context: {e}");
-                return Ok(());
-            }
-        };
-
         for workflow in workflows.iter() {
             let def: WorkflowDef = match serde_json::from_value(workflow.definition.clone()) {
                 Ok(d) => d,
@@ -399,6 +391,19 @@ impl WorkflowEngine {
                 continue;
             }
 
+            let trigger_ctx_json = match snapshot::InitialExecutionSnapshot::capture(
+                workflow.id,
+                channel_id,
+                &workflow.owner_pubkey,
+                &def,
+                &trigger_ctx,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(workflow_id=%workflow.id, "Initial snapshot invalid: {error}");
+                    continue;
+                }
+            };
             let trigger_event_id_bytes = event.event.id.as_bytes().to_vec();
             let run_id = match self
                 .db
@@ -651,7 +656,13 @@ impl WorkflowEngine {
                     timestamp: now.timestamp().to_string(),
                     ..Default::default()
                 };
-                let trigger_ctx_json = match serde_json::to_value(&trigger_ctx) {
+                let trigger_ctx_json = match snapshot::InitialExecutionSnapshot::capture(
+                    workflow.id,
+                    channel_id,
+                    &workflow.owner_pubkey,
+                    &def,
+                    &trigger_ctx,
+                ) {
                     Ok(v) => Some(v),
                     Err(e) => {
                         tracing::error!(
@@ -1996,6 +2007,17 @@ steps:
             .await
             .expect("list runs");
         assert_eq!(runs.len(), 1, "member owner's workflow must fire");
+        let original = snapshot::InitialExecutionSnapshot::from_stored(
+            runs[0]
+                .trigger_context
+                .as_ref()
+                .expect("original dispatch snapshot"),
+        )
+        .expect("initial snapshot");
+        assert_eq!(original.workflow_id, workflow_id);
+        assert_eq!(original.channel_id, channel_id);
+        assert_eq!(original.definition.name, "sec006-event");
+        assert_eq!(original.owner_pubkey, hex::encode(&member));
 
         // Remove the owner (actor = channel creator, an owner-role member).
         db.remove_member(community, channel_id, &member, &creator)

@@ -2156,7 +2156,6 @@ pub async fn workflow_webhook(
             trigger_ctx.webhook_fields.insert(k.clone(), val_str);
         }
     }
-    let trigger_ctx_json = serde_json::to_value(&trigger_ctx).ok();
 
     // SEC-006: the webhook secret authenticates the *caller*, but the run
     // executes with the workflow **owner's** standing authority — so the
@@ -2178,9 +2177,17 @@ pub async fn workflow_webhook(
         .await
         .map_err(|_| not_found("workflow not found"))?;
 
+    let trigger_ctx_json = buzz_workflow::snapshot::InitialExecutionSnapshot::capture(
+        id,
+        wf_channel_id,
+        &workflow.owner_pubkey,
+        &def,
+        &trigger_ctx,
+    )
+    .map_err(|e| super::internal_error(&format!("initial snapshot: {e}")))?;
     let run_id = state
         .db
-        .create_workflow_run(community_id, id, None, trigger_ctx_json.as_ref())
+        .create_workflow_run(community_id, id, None, Some(&trigger_ctx_json))
         .await
         .map_err(|e| super::internal_error(&format!("db error: {e}")))?;
 

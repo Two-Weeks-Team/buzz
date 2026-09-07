@@ -128,6 +128,14 @@
       "status": "candidate"
     },
     {
+      "id": "workflow-initial-snapshot",
+      "summary": "Persist original definition, trigger and owner/channel bindings at all run entrypoints and atomically create manual command runs",
+      "paths": ["crates/buzz-workflow/src/snapshot.rs", "crates/buzz-workflow/src/lib.rs", "crates/buzz-db/src/store/workflow.rs", "crates/buzz-relay/src/handlers/command_executor.rs", "crates/buzz-relay/src/api/bridge.rs"],
+      "tests": ["cargo test -p buzz-workflow --lib --locked --no-default-features", "cargo test -p buzz-db workflow_run_creation_joins_caller_transaction --lib --locked -- --ignored", "cargo test -p buzz-workflow on_event_denies_run_after_owner_removed --lib --locked --no-default-features -- --ignored"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/crates/buzz-workflow/src/lib.rs",
+      "status": "candidate"
+    },
+    {
       "id": "approval-snapshot-resume-claim",
       "summary": "Carry typed approval snapshots, reject legacy/default resume context, and claim granted runs once",
       "paths": ["crates/buzz-workflow/src/snapshot.rs", "crates/buzz-workflow/src/executor.rs", "crates/buzz-workflow/src/error.rs", "crates/buzz-workflow/src/lib.rs", "crates/buzz-db/src/store/workflow.rs", "crates/buzz-relay/src/handlers/command_executor.rs"],
