@@ -77,3 +77,68 @@ impl ExecutionSnapshot {
         Ok(stored.snapshot)
     }
 }
+
+impl crate::WorkflowEngine {
+    pub(crate) async fn persist_approval_gate(
+        &self,
+        community: buzz_core::tenant::CommunityId,
+        run_id: uuid::Uuid,
+        step_index: usize,
+        token: &str,
+        snapshot: Option<&ExecutionSnapshot>,
+        trace: &serde_json::Value,
+    ) -> Result<(), WorkflowError> {
+        let snapshot = snapshot
+            .ok_or_else(|| WorkflowError::InvalidDefinition("missing approval snapshot".into()))?;
+        snapshot.validate()?;
+        if snapshot.gate.step_index != step_index || token.is_empty() {
+            return Err(WorkflowError::InvalidDefinition(
+                "approval result binding mismatch".into(),
+            ));
+        }
+        let step_index = i32::try_from(step_index)
+            .map_err(|_| WorkflowError::InvalidDefinition("approval step overflow".into()))?;
+        let seconds = i64::try_from(snapshot.gate.timeout_secs)
+            .map_err(|_| WorkflowError::InvalidDefinition("approval timeout overflow".into()))?;
+        let duration = chrono::Duration::try_seconds(seconds)
+            .ok_or_else(|| WorkflowError::InvalidDefinition("approval duration overflow".into()))?;
+        let expires_at = chrono::Utc::now()
+            .checked_add_signed(duration)
+            .ok_or_else(|| WorkflowError::InvalidDefinition("approval expiry overflow".into()))?;
+        let run = self
+            .db
+            .get_workflow_run(community, run_id)
+            .await
+            .map_err(|e| WorkflowError::Database(e.to_string()))?;
+        let context = serde_json::to_value(snapshot)
+            .map_err(|e| WorkflowError::InvalidDefinition(e.to_string()))?;
+        let mut trace = trace.as_array().cloned().ok_or_else(|| {
+            WorkflowError::InvalidDefinition("approval trace must be an array".into())
+        })?;
+        trace.push(serde_json::json!({
+            "step_id": snapshot.gate.step_id,
+            "status": "waiting_approval",
+            "message": snapshot.gate.message,
+            "approver_spec": snapshot.gate.from,
+            "approval_ref": hex::encode(buzz_db::workflow::hash_approval_token(token)),
+        }));
+        let trace = serde_json::Value::Array(trace);
+        self.db
+            .suspend_workflow_run(
+                buzz_db::workflow::CreateApprovalParams {
+                    community_id: community,
+                    token,
+                    workflow_id: run.workflow_id,
+                    run_id,
+                    step_id: &snapshot.gate.step_id,
+                    step_index,
+                    approver_spec: &snapshot.gate.from,
+                    expires_at,
+                },
+                &trace,
+                &context,
+            )
+            .await
+            .map_err(|e| WorkflowError::Database(e.to_string()))
+    }
+}

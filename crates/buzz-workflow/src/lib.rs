@@ -227,32 +227,24 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
+                if let Some(token) = result.approval_token {
                     if let Err(e) = self
-                        .db
-                        .update_workflow_run(
+                        .persist_approval_gate(
                             community_id,
                             run_id,
-                            RunStatus::Failed,
-                            step_count,
+                            result.step_index,
+                            &token,
+                            result.snapshot.as_ref(),
                             &trace_json,
-                            Some(buzz_db::workflow::WorkflowRunFailure {
-                                code: "approval_not_supported",
-                                message: "approval gates not yet implemented — see WF-08",
-                            }),
                         )
                         .await
                     {
+                        // Do not overwrite a concurrent gate or pretend a failed
+                        // suspension completed. The durable run remains available
+                        // for operator investigation; running effects are not replayed.
                         tracing::error!(
                             run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
+                            "Failed to persist workflow approval gate: {e}"
                         );
                     }
                 } else {

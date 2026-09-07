@@ -1415,6 +1415,67 @@ mod postgres_tests {
         .expect("workflow event")
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn native_executor_finalizer_persists_queryable_approval_gate() {
+        let (db, tenant) = persistence_test_context().await;
+        let community = tenant.community();
+        let owner = Keys::generate().public_key().to_bytes();
+        db.ensure_user(community, &owner).await.expect("owner");
+        let (definition, json) = buzz_workflow::WorkflowEngine::parse_yaml(
+            "name: durable-gate\ntrigger:\n  on: message_posted\nsteps:\n  - id: gate\n    action: request_approval\n    from: '@anyone'\n    message: 'Review {{trigger.text}}'\n    timeout: 1h\n",
+        ).expect("definition");
+        let workflow_id = db
+            .create_workflow(community, None, &owner, "durable-gate", &json, &[7; 32])
+            .await
+            .expect("workflow");
+        let run_id = db
+            .create_workflow_run(community, workflow_id, None, None)
+            .await
+            .expect("run");
+        let engine = buzz_workflow::WorkflowEngine::new(db.clone(), Default::default());
+        let trigger = buzz_workflow::executor::TriggerContext {
+            text: "synthetic request".into(),
+            ..Default::default()
+        };
+        let result =
+            buzz_workflow::executor::execute_run(&engine, community, run_id, &definition, &trigger)
+                .await
+                .expect("native executor");
+        assert!(result.approval_token.is_some());
+        engine
+            .finalize_run(community, run_id, Ok(result), None)
+            .await;
+        let run = db
+            .get_workflow_run(community, run_id)
+            .await
+            .expect("run read");
+        assert_eq!(run.status, RunStatus::WaitingApproval);
+        let snapshot = buzz_workflow::snapshot::ExecutionSnapshot::from_stored(
+            run.trigger_context.as_ref().expect("durable context"),
+        )
+        .expect("typed context");
+        assert_eq!(snapshot.gate.message, "Review synthetic request");
+        assert_eq!(snapshot.gate.timeout_secs, 3600);
+        let approvals = db
+            .get_run_approvals(community, workflow_id, run_id)
+            .await
+            .expect("query approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+        assert_eq!(approvals[0].token.len(), 32);
+        assert_eq!(approvals[0].step_id, "gate");
+        assert_eq!(approvals[0].approver_spec, "@anyone");
+        assert_eq!(
+            run.execution_trace[0]["message"],
+            "Review synthetic request"
+        );
+        assert_eq!(
+            run.execution_trace[0]["approval_ref"],
+            hex::encode(&approvals[0].token)
+        );
+    }
+
     fn rejection_message(result: Result<Option<Vec<u8>>, IngestError>) -> String {
         match result {
             Err(IngestError::Rejected(message)) => message,
