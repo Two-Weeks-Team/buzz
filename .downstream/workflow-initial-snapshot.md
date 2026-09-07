@@ -28,6 +28,14 @@ PostgreSQL tests cover bounded inventory/exclusion of progress, legacy and scope
 rejection, disabled workflows, removed membership, original question/input after
 definition edits and two competing recovery calls yielding one approval gate.
 Real signed ingress/restart wire proof must be recorded separately per revision.
-Schedule-fire claim and run creation still have a separate-commit gap. Post-claim
+Schedule dispatch now prepares its snapshot before claiming an instant and uses
+one transaction for claim, Pending run and audit link. Insert/link failure rolls
+back the claim as well; duplicate claims create no run. Local transaction lock
+and statement timeouts bound contention. Old orphan claims are not replayed or
+deleted: their provenance/effect history requires separate reconciliation.
+Database fault tests cover each later write, concurrent dedupe and tenant scope.
+This does not prove real cron timing, process interruption during commit or an
+operational scheduler SLA; live schedule/restart evidence is a separate gate.
+Post-claim
 Running uncertainty, lifecycle outbox and business effect reconciliation remain
 unfinished and are not replaced by this snapshot.

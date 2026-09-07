@@ -136,6 +136,14 @@
       "status": "candidate"
     },
     {
+      "id": "workflow-atomic-schedule-dispatch",
+      "summary": "Commit schedule claim, original inputs, Pending run and audit link in one bounded transaction",
+      "paths": ["crates/buzz-db/src/store/workflow.rs", "crates/buzz-workflow/src/lib.rs"],
+      "tests": ["cargo test -p buzz-db scheduled_run_transaction_rolls_back_and_deduplicates --lib --locked -- --ignored", "cargo test -p buzz-workflow --lib --locked --no-default-features"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/crates/buzz-workflow/src/lib.rs",
+      "status": "candidate"
+    },
+    {
       "id": "workflow-pending-recovery",
       "summary": "Recover untouched Pending runs from pinned inputs with current authority and a single initial claim",
       "paths": ["crates/buzz-db/src/store/workflow.rs", "crates/buzz-relay/src/workflow_recovery.rs", "crates/buzz-relay/src/main.rs"],

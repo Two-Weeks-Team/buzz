@@ -483,6 +483,9 @@ pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRec
 
 /// Claim a scheduled workflow fire for an authoritative schedule instant.
 ///
+/// Low-level primitive; production dispatch should use
+/// [`Db::create_scheduled_workflow_run`] to avoid orphan claims on insert failure.
+///
 /// Returns `Some` only for the first pod that claims `(community_id,
 /// workflow_id, scheduled_for)`. All other pods receive `None` and must skip
 /// creating a workflow run. The `scheduled_for` value must come from an
@@ -498,12 +501,15 @@ pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRec
 /// would fan a single claim across every community holding that UUID. Binding
 /// `(community_id, id)` confines the claim — and its `SELECT`/`INSERT` row — to
 /// exactly the intended tenant.
-pub async fn claim_scheduled_workflow_fire(
-    pool: &PgPool,
+pub async fn claim_scheduled_workflow_fire<'e, E>(
+    executor: E,
     community_id: CommunityId,
     workflow_id: Uuid,
     scheduled_for: DateTime<Utc>,
-) -> Result<Option<ScheduledWorkflowFireClaim>> {
+) -> Result<Option<ScheduledWorkflowFireClaim>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let row = sqlx::query(
         r#"
         INSERT INTO scheduled_workflow_fires (community_id, workflow_id, scheduled_for)
@@ -517,7 +523,7 @@ pub async fn claim_scheduled_workflow_fire(
     .bind(community_id.as_uuid())
     .bind(workflow_id)
     .bind(scheduled_for)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     row.map(|row| {
@@ -561,17 +567,19 @@ pub async fn latest_scheduled_workflow_fire(
 
 /// Link a won scheduled-fire claim to the workflow run it created.
 ///
-/// This is for ops/audit forensics only; the claim row remains the dedupe
-/// boundary. If run creation succeeds, callers should attach the run id before
-/// spawning execution. If run creation fails, leaving `workflow_run_id` NULL is
-/// intentional: the schedule instant was claimed and must not duplicate later.
-pub async fn attach_scheduled_workflow_run(
-    pool: &PgPool,
+/// Low-level primitive used inside the atomic dispatch transaction. The claim
+/// remains the dedupe boundary. Historical standalone/orphan claims must not be
+/// replayed without reconciling their execution/effect history.
+pub async fn attach_scheduled_workflow_run<'e, E>(
+    executor: E,
     community_id: CommunityId,
     workflow_id: Uuid,
     scheduled_for: DateTime<Utc>,
     workflow_run_id: Uuid,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         r#"
         UPDATE scheduled_workflow_fires
@@ -586,7 +594,7 @@ pub async fn attach_scheduled_workflow_run(
     .bind(workflow_id)
     .bind(scheduled_for)
     .bind(workflow_run_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(result.rows_affected() == 1)
@@ -1384,6 +1392,41 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Commit the schedule claim, original inputs, Pending run and audit link
+    /// together. A failed insert/link leaves the instant available for retry.
+    /// Only the winning transaction returns a run; losers create no run.
+    pub async fn create_scheduled_workflow_run(
+        &self,
+        community: CommunityId,
+        workflow: Uuid,
+        scheduled_for: DateTime<Utc>,
+        snapshot: &serde_json::Value,
+    ) -> Result<Option<Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
+        if claim_scheduled_workflow_fire(&mut *tx, community, workflow, scheduled_for)
+            .await?
+            .is_none()
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let run = create_workflow_run(&mut *tx, community, workflow, None, Some(snapshot)).await?;
+        if !attach_scheduled_workflow_run(&mut *tx, community, workflow, scheduled_for, run).await?
+        {
+            return Err(DbError::NotFound(
+                "scheduled claim disappeared before link".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(Some(run))
+    }
+
     /// Host-only bounded keyset inventory. Callers must decode original inputs,
     /// recheck current authority and acquire the atomic initial claim. Invalid
     /// snapshots are not filtered here, so paging can advance past legacy rows.
@@ -3794,6 +3837,104 @@ mod postgres_tests {
         }
         expected.sort();
         assert_eq!(found, expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn scheduled_run_transaction_rolls_back_and_deduplicates() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow = Uuid::new_v4();
+        insert_workflow_with_ids(
+            &pool,
+            community,
+            workflow,
+            Uuid::new_v4(),
+            "atomic-schedule",
+        )
+        .await;
+        let db = Db::from_pool(pool.clone());
+        let snapshot =
+            serde_json::json!({"buzz_execution_version":2,"initial":{"marker":"original"}});
+        let instant = Utc::now();
+        // Fault both the run insert and the final audit link. Identifiers and
+        // injected literals are generated UUIDs; no external input enters DDL.
+        for (table, operation) in [
+            ("workflow_runs", "INSERT"),
+            ("scheduled_workflow_fires", "UPDATE"),
+        ] {
+            let fault = format!("schedule_fault_{}", Uuid::new_v4().simple());
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE FUNCTION {fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.workflow_id='{workflow}'::uuid THEN RAISE EXCEPTION 'synthetic scheduled persist failure'; END IF; RETURN NEW; END $$"))).execute(&pool).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER {fault} BEFORE {operation} ON {table} FOR EACH ROW EXECUTE FUNCTION {fault}()"))).execute(&pool).await.unwrap();
+            let failed = db
+                .create_scheduled_workflow_run(community, workflow, instant, &snapshot)
+                .await;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP TRIGGER {fault} ON {table}"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {fault}()")))
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(failed.is_err());
+            assert_eq!(
+                db.latest_scheduled_workflow_fire(community, workflow)
+                    .await
+                    .unwrap(),
+                None
+            );
+            let runs: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM workflow_runs WHERE community_id=$1 AND workflow_id=$2",
+            )
+            .bind(community.as_uuid())
+            .bind(workflow)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(runs, 0);
+        }
+        let (first, second) = tokio::join!(
+            db.create_scheduled_workflow_run(community, workflow, instant, &snapshot),
+            db.create_scheduled_workflow_run(community, workflow, instant, &snapshot),
+        );
+        let winners: Vec<_> = [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(winners.len(), 1);
+        let run = db.get_workflow_run(community, winners[0]).await.unwrap();
+        assert_eq!(run.status, RunStatus::Pending);
+        assert_eq!(run.trigger_context, Some(snapshot.clone()));
+        let linked: Uuid = sqlx::query_scalar("SELECT workflow_run_id FROM scheduled_workflow_fires WHERE community_id=$1 AND workflow_id=$2 AND scheduled_for=$3")
+            .bind(community.as_uuid()).bind(workflow).bind(instant).fetch_one(&pool).await.unwrap();
+        assert_eq!(linked, run.id);
+        assert!(db
+            .create_scheduled_workflow_run(community, workflow, instant, &snapshot)
+            .await
+            .unwrap()
+            .is_none());
+        let foreign = make_community(&pool).await;
+        assert!(db
+            .create_scheduled_workflow_run(foreign, workflow, instant, &snapshot)
+            .await
+            .unwrap()
+            .is_none());
+        insert_workflow_with_ids(
+            &pool,
+            foreign,
+            workflow,
+            Uuid::new_v4(),
+            "same-id-other-tenant",
+        )
+        .await;
+        assert!(db
+            .create_scheduled_workflow_run(foreign, workflow, instant, &snapshot)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------

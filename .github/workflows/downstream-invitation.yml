@@ -67,6 +67,7 @@ jobs:
       - run: cargo test -p buzz-db workflow_initial_claim_is_single_and_preserves_progress --lib --locked -- --ignored
       - run: cargo test -p buzz-db workflow_run_creation_joins_caller_transaction --lib --locked -- --ignored
       - run: cargo test -p buzz-db pending_start_inventory_is_bounded_and_excludes_progress --lib --locked -- --ignored
+      - run: cargo test -p buzz-db scheduled_run_transaction_rolls_back_and_deduplicates --lib --locked -- --ignored
       - run: cargo test -p buzz-relay pending_recovery_uses_original_inputs_and_current_authority --lib --locked --no-default-features -- --ignored
       - run: cargo test -p buzz-workflow on_event_denies_run_after_owner_removed --lib --locked --no-default-features -- --ignored
       - run: cargo test -p buzz-db approval_decision_joins_transaction_and_checks_write_time_expiry --lib --locked -- --ignored

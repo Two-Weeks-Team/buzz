@@ -617,40 +617,7 @@ impl WorkflowEngine {
                     continue;
                 }
 
-                // Durable at-most-once claim — the cross-pod fire boundary.
-                // The loser receives `None` and skips BEFORE any run creation or
-                // side effect. `community_id` is the workflow row's own
-                // community (server provenance from the scan), never client
-                // input; the claim binds `(community_id, workflow_id,
-                // scheduled_for)` so a duplicate workflow UUID in another
-                // community claims independently.
-                match self
-                    .db
-                    .claim_scheduled_workflow_fire(community_id, workflow.id, scheduled_for)
-                    .await
-                {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        // Another pod (or an earlier tick this pod) already
-                        // claimed this instant. Still advance the in-memory
-                        // interval clock so we don't re-attempt the claim every
-                        // tick for the rest of the interval.
-                        if trigger_type == "interval" {
-                            self.last_fired.insert((community_id, workflow.id), now);
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            workflow_id = %workflow.id,
-                            "Cron tick: scheduled-fire claim failed: {e}"
-                        );
-                        continue;
-                    }
-                }
-
-                // Fix 5: handle serialization errors explicitly rather than silently
-                // dropping the trigger context with .ok().
+                // Prepare original inputs BEFORE consuming a schedule instant.
                 let trigger_ctx = executor::TriggerContext {
                     channel_id: channel_id.to_string(),
                     timestamp: now.timestamp().to_string(),
@@ -663,7 +630,7 @@ impl WorkflowEngine {
                     &def,
                     &trigger_ctx,
                 ) {
-                    Ok(v) => Some(v),
+                    Ok(v) => v,
                     Err(e) => {
                         tracing::error!(
                             workflow_id = %workflow.id,
@@ -675,42 +642,33 @@ impl WorkflowEngine {
 
                 let run_id = match self
                     .db
-                    .create_workflow_run(
+                    .create_scheduled_workflow_run(
                         community_id,
                         workflow.id,
-                        None, // no trigger event for cron
-                        trigger_ctx_json.as_ref(),
+                        scheduled_for,
+                        &trigger_ctx_json,
                     )
                     .await
                 {
-                    Ok(id) => id,
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        // A committed competing claim already owns this instant.
+                        if trigger_type == "interval" {
+                            self.last_fired.insert((community_id, workflow.id), now);
+                        }
+                        continue;
+                    }
                     Err(e) => {
                         tracing::error!(
                             workflow_id = %workflow.id,
-                            "Cron tick: failed to create workflow run: {e}"
+                            "Cron tick: schedule claim/run transaction failed: {e}"
                         );
-                        // The claim is held but the run failed to create. The
-                        // claim row intentionally stays (its `workflow_run_id`
-                        // NULL) so this instant is not re-fired: at-most-once is
-                        // preserved over exactly-once on transient run-insert
-                        // failures.
+                        // Rollback leaves the instant unclaimed. A lost commit
+                        // response may instead leave a recoverable Pending run;
+                        // a later tick cannot duplicate its committed claim.
                         continue;
                     }
                 };
-
-                // Link the won claim to its run for ops/audit forensics. The
-                // claim row already guarantees dedupe; this is best-effort.
-                if let Err(e) = self
-                    .db
-                    .attach_scheduled_workflow_run(community_id, workflow.id, scheduled_for, run_id)
-                    .await
-                {
-                    tracing::warn!(
-                        workflow_id = %workflow.id,
-                        run_id = %run_id,
-                        "Cron tick: failed to attach run to scheduled-fire claim: {e}"
-                    );
-                }
 
                 // Update last_fired AFTER a successful claim+insert so that a
                 // failure doesn't suppress the next tick for the full interval.
