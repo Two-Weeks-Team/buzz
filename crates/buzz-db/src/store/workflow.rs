@@ -1360,6 +1360,14 @@ impl Db {
     /// concurrent workers skip locked gates and never overwrite granted tokens.
     pub async fn expire_workflow_approvals(&self) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
+        // Approval SKIP LOCKED does not bound the subsequent run-row lock.
+        // Local settings disappear at commit/rollback and never change the pool.
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query(
             "SELECT a.community_id,a.token,a.run_id,a.workflow_id,a.step_index
              FROM workflow_approvals a
@@ -3309,6 +3317,67 @@ mod postgres_tests {
             ApprovalStatus::Pending
         );
         decision.rollback().await.expect("release lock");
+        let mut run_lock = pool.begin().await.expect("run lock transaction");
+        sqlx::query("SELECT id FROM workflow_runs WHERE community_id=$1 AND id=$2 FOR UPDATE")
+            .bind(community.as_uuid())
+            .bind(fixtures[0].1)
+            .fetch_one(&mut *run_lock)
+            .await
+            .expect("hold run lock");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            db.expire_workflow_approvals(),
+        )
+        .await
+        .expect("database must bound its own lock wait");
+        assert!(
+            result.is_err(),
+            "lock timeout propagates instead of false success"
+        );
+        run_lock.rollback().await.expect("release run lock");
+        assert_eq!(
+            get_approval(&pool, community, &fixtures[0].2)
+                .await
+                .expect("after timeout")
+                .status,
+            ApprovalStatus::Pending
+        );
+
+        // Fail the second write after run cancellation has happened in the same
+        // transaction. A torn persist would leave the run cancelled here.
+        let fault = format!("expiry_fault_{}", Uuid::new_v4().simple());
+        // Audited test-only DDL: identifiers use a fixed prefix plus generated
+        // UUID hex, and the sole SQL value is a typed UUID, never external text.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE FUNCTION {fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.run_id='{}'::uuid AND NEW.status='expired' THEN RAISE EXCEPTION 'synthetic expiry persist failure'; END IF; RETURN NEW; END $$", fixtures[0].1)))
+            .execute(&pool).await.expect("fault function");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER {fault} BEFORE UPDATE ON workflow_approvals FOR EACH ROW EXECUTE FUNCTION {fault}()")))
+            .execute(&pool).await.expect("fault trigger");
+        let failed = db.expire_workflow_approvals().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER {fault} ON workflow_approvals"
+        )))
+        .execute(&pool)
+        .await
+        .expect("remove fault trigger");
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {fault}()")))
+            .execute(&pool)
+            .await
+            .expect("remove fault function");
+        assert!(failed.is_err());
+        assert_eq!(
+            get_workflow_run(&pool, community, fixtures[0].1)
+                .await
+                .expect("run rollback")
+                .status,
+            RunStatus::WaitingApproval
+        );
+        assert_eq!(
+            get_approval(&pool, community, &fixtures[0].2)
+                .await
+                .expect("approval rollback")
+                .status,
+            ApprovalStatus::Pending
+        );
         let (first, second) = tokio::join!(
             db.expire_workflow_approvals(),
             db.expire_workflow_approvals()
