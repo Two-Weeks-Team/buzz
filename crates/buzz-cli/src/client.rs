@@ -791,31 +791,44 @@ impl BuzzClient {
 
     /// Execute a one-shot query with multiple filters via the HTTP bridge.
     /// Each filter is ORed by the relay (standard Nostr REQ behavior).
+    /// Rejects malformed JSON and non-object rows before any command can
+    /// interpret a failed response as an empty result. Preserves valid raw JSON.
     pub async fn query_multi(&self, filters: &[serde_json::Value]) -> Result<String, CliError> {
         let url = format!("{}/query", self.relay_url);
         let body = bytes::Bytes::from(
             serde_json::to_vec(filters)
                 .map_err(|e| CliError::Other(format!("filter serialization failed: {e}")))?,
         );
-        self.with_retry_body(|| {
-            let body = body.clone();
-            let url = url.clone();
-            async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
-                let resp = self
-                    .with_auth_tag(
-                        self.http
-                            .post(&url)
-                            .header("Authorization", auth)
-                            .header("Content-Type", "application/json")
-                            .body(body),
-                    )
-                    .send()
-                    .await?;
-                self.handle_response(resp).await
-            }
-        })
-        .await
+        let raw = self
+            .with_retry_body(|| {
+                let body = body.clone();
+                let url = url.clone();
+                async move {
+                    let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                    let resp = self
+                        .with_auth_tag(
+                            self.http
+                                .post(&url)
+                                .header("Authorization", auth)
+                                .header("Content-Type", "application/json")
+                                .body(body),
+                        )
+                        .send()
+                        .await?;
+                    self.handle_response(resp).await
+                }
+            })
+            .await?;
+        // Validate the shared read boundary, including callers that currently
+        // default a failed second parse to an empty list. This is structural
+        // validation, not event signature or authorization verification.
+        let _: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(&raw)
+            .map_err(|_| {
+                CliError::Other(
+                    "invalid query response: expected JSON array of event objects".into(),
+                )
+            })?;
+        Ok(raw)
     }
 
     /// Execute a one-shot count via the HTTP bridge.
@@ -1502,6 +1515,9 @@ pub fn normalize_write_response(raw: &str) -> String {
     }
     raw.to_string()
 }
+
+#[cfg(test)]
+mod query_response_tests;
 
 #[cfg(test)]
 mod retry_tests {

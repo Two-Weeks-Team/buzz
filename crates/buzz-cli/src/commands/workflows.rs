@@ -322,6 +322,58 @@ fn approval_reference(value: &str) -> Result<String, CliError> {
     Ok(hex::encode(Sha256::digest(value.as_bytes())))
 }
 
+pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(), CliError> {
+    use crate::WorkflowsCmd;
+    match cmd {
+        WorkflowsCmd::List { channel } => cmd_list_workflows(client, &channel).await,
+        WorkflowsCmd::Get { workflow } => cmd_get_workflow(client, &workflow).await,
+        WorkflowsCmd::Create { channel, yaml } => {
+            cmd_create_workflow(client, &channel, &yaml).await
+        }
+        WorkflowsCmd::Update {
+            channel,
+            workflow,
+            yaml,
+        } => cmd_update_workflow(client, &channel, &workflow, &yaml).await,
+        WorkflowsCmd::Delete { workflow } => cmd_delete_workflow(client, &workflow).await,
+        WorkflowsCmd::Trigger { workflow, inputs } => {
+            cmd_trigger_workflow(client, &workflow, inputs.as_deref()).await
+        }
+        WorkflowsCmd::Runs {
+            workflow,
+            limit,
+            before,
+            before_id,
+        } => {
+            cmd_get_workflow_runs(
+                client,
+                &workflow,
+                limit,
+                before.as_deref(),
+                before_id.as_deref(),
+            )
+            .await
+        }
+        WorkflowsCmd::Approvals { workflow, run } => {
+            cmd_get_workflow_approvals(client, &workflow, &run).await
+        }
+        WorkflowsCmd::Attempts {
+            workflow,
+            run,
+            limit,
+            after_index,
+        } => cmd_get_workflow_attempts(client, &workflow, &run, limit, after_index).await,
+        WorkflowsCmd::Approve {
+            token,
+            approved,
+            note,
+        } => {
+            // approved is already a bool — no parse_bool_flag needed
+            cmd_approve_step(client, &token, approved, note.as_deref()).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod approval_reference_tests {
     use super::*;
@@ -374,58 +426,6 @@ mod approval_reference_tests {
         );
         for malformed in ["", "bad", &"g".repeat(64), &"a".repeat(63)] {
             assert!(approval_reference(malformed).is_err());
-        }
-    }
-}
-
-pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(), CliError> {
-    use crate::WorkflowsCmd;
-    match cmd {
-        WorkflowsCmd::List { channel } => cmd_list_workflows(client, &channel).await,
-        WorkflowsCmd::Get { workflow } => cmd_get_workflow(client, &workflow).await,
-        WorkflowsCmd::Create { channel, yaml } => {
-            cmd_create_workflow(client, &channel, &yaml).await
-        }
-        WorkflowsCmd::Update {
-            channel,
-            workflow,
-            yaml,
-        } => cmd_update_workflow(client, &channel, &workflow, &yaml).await,
-        WorkflowsCmd::Delete { workflow } => cmd_delete_workflow(client, &workflow).await,
-        WorkflowsCmd::Trigger { workflow, inputs } => {
-            cmd_trigger_workflow(client, &workflow, inputs.as_deref()).await
-        }
-        WorkflowsCmd::Runs {
-            workflow,
-            limit,
-            before,
-            before_id,
-        } => {
-            cmd_get_workflow_runs(
-                client,
-                &workflow,
-                limit,
-                before.as_deref(),
-                before_id.as_deref(),
-            )
-            .await
-        }
-        WorkflowsCmd::Approvals { workflow, run } => {
-            cmd_get_workflow_approvals(client, &workflow, &run).await
-        }
-        WorkflowsCmd::Attempts {
-            workflow,
-            run,
-            limit,
-            after_index,
-        } => cmd_get_workflow_attempts(client, &workflow, &run, limit, after_index).await,
-        WorkflowsCmd::Approve {
-            token,
-            approved,
-            note,
-        } => {
-            // approved is already a bool — no parse_bool_flag needed
-            cmd_approve_step(client, &token, approved, note.as_deref()).await
         }
     }
 }

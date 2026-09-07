@@ -2415,6 +2415,7 @@ mod tests {
             vec![
                 "approvals",
                 "approve",
+                "attempts",
                 "create",
                 "delete",
                 "get",
@@ -2520,7 +2521,7 @@ mod tests {
             ("social", 7),
             ("upload", 1),
             ("users", 5),
-            ("workflows", 9),
+            ("workflows", 10),
         ];
 
         let cmd = Cli::command();

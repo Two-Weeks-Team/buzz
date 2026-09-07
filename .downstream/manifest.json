@@ -8,6 +8,14 @@
   "automatic_publish": false,
   "patches": [
     {
+      "id": "cli-query-response-contract",
+      "summary": "Reject malformed query responses before callers can turn unavailable data into empty success",
+      "paths": ["crates/buzz-cli/src/client.rs", "crates/buzz-cli/src/client/query_response_tests.rs", "crates/buzz-cli/src/lib.rs", ".github/workflows/downstream-invitation.yml"],
+      "tests": ["cargo test -p buzz-cli --lib --locked --no-default-features", "cargo clippy -p buzz-cli --all-targets --locked -- -D warnings"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/crates/buzz-cli/src/client.rs",
+      "status": "candidate"
+    },
+    {
       "id": "desktop-step-journal",
       "summary": "Read scoped durable attempt pages without inferring external success or retry authority",
       "paths": ["desktop/src-tauri/src/commands/workflows.rs", "desktop/src/shared/api/workflowAttempts.ts", "desktop/src/features/workflows/ui/WorkflowStepJournal.tsx"],
