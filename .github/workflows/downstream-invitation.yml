@@ -45,7 +45,7 @@ jobs:
           POSTGRES_DB: preflight
         ports: ['5432:5432']
         options: >-
-          --health-cmd 'pg_isready -U preflight -d preflight'
+          --health-cmd "pg_isready -U preflight -d preflight"
           --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
