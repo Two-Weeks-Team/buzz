@@ -413,6 +413,22 @@ CREATE INDEX idx_workflow_runs_execution_lease ON workflow_runs (execution_lease
     WHERE status = 'running' AND execution_token IS NOT NULL;
 
 -- ── Workflow approvals ────────────────────────────────────────────────────────
+-- No historical backfill: an absent attempt does not establish no effects.
+CREATE TABLE workflow_step_attempts (
+    community_id UUID NOT NULL,
+    run_id UUID NOT NULL,
+    step_index INT NOT NULL CHECK (step_index >= 0 AND step_index < 4096),
+    execution_epoch BIGINT NOT NULL CHECK (execution_epoch > 0),
+    step_id TEXT NOT NULL CHECK (octet_length(step_id) BETWEEN 1 AND 256),
+    action_digest BYTEA NOT NULL CHECK (octet_length(action_digest) = 32),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    returned_at TIMESTAMPTZ,
+    result JSONB CHECK (octet_length(result::text) <= 65536),
+    PRIMARY KEY (community_id, run_id, step_index),
+    FOREIGN KEY (community_id, run_id) REFERENCES workflow_runs (community_id, id) ON DELETE CASCADE,
+    CHECK ((returned_at IS NULL) = (result IS NULL))
+);
+
 -- token-hash lookup scoped: approval token grants cannot act on another
 -- community's same hash (conformance).
 
@@ -1758,6 +1774,7 @@ SELECT attach_community_write_fence('thread_metadata');
 SELECT attach_community_write_fence('users');
 SELECT attach_community_write_fence('workflow_approvals');
 SELECT attach_community_write_fence('workflow_runs');
+SELECT attach_community_write_fence('workflow_step_attempts');
 SELECT attach_community_write_fence('workflows');
 
 -- ── Relay operator/moderator roster ──────────────────────────────────────────

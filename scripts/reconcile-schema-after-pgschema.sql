@@ -225,3 +225,5 @@ BEGIN
         RAISE EXCEPTION 'replica_heartbeat must contain its singleton row after pgschema apply';
     END IF;
 END $$;
+-- pgschema does not execute schema.sql's SELECT-based trigger attachment.
+SELECT attach_community_write_fence('workflow_step_attempts');

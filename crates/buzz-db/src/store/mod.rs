@@ -54,3 +54,5 @@ pub mod usage;
 pub mod user;
 /// Workflow, run, and approval persistence.
 pub mod workflow;
+/// Fenced workflow step intent and returned-result journal.
+pub mod workflow_steps;

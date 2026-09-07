@@ -702,7 +702,12 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 45);
+        assert_eq!(migrations.len(), 46);
+        assert_eq!(migrations[45].version, 46);
+        assert!(migrations[45]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE workflow_step_attempts"));
         assert_eq!(migrations[44].version, 45);
         assert!(migrations[44]
             .sql
@@ -1839,6 +1844,18 @@ mod postgres_tests {
         let mut expected_fences = migration.fence_attachments.clone();
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
+        let journal_sql = std::fs::read_to_string(
+            workspace_root.join("migrations/0046_workflow_step_attempts.sql"),
+        )
+        .expect("read journal migration");
+        let journal = surface(&journal_sql);
+        assert_eq!(journal.tables.len(), 1);
+        assert_eq!(
+            journal.tables.get("workflow_step_attempts"),
+            schema.tables.get("workflow_step_attempts")
+        );
+        assert!(journal.fence_attachments.contains("workflow_step_attempts"));
+        expected_fences.extend(journal.fence_attachments);
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

@@ -72,6 +72,11 @@ jobs:
       - run: cargo test -p buzz-db workflow_execution_fences_expiry_and_stale_completion --lib --locked -- --ignored
       - run: cargo test -p buzz-db workflow_execution_resume_rotates_ownership --lib --locked -- --ignored
       - run: cargo test -p buzz-db execution_observation_is_bounded_token_free_and_conservative --lib --locked -- --ignored
+      - run: cargo test -p buzz-db workflow_step_journal_fences_intent_and_return --lib --locked -- --ignored
+      - name: Verify step journal on a separate migration-managed database
+        run: |
+          psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE workflow_step_journal_migration'
+          BUZZ_TEST_DATABASE_URL=postgres://preflight:isolated-test-only@127.0.0.1:5432/workflow_step_journal_migration BUZZ_TEST_SCHEMA_MODE=migration cargo test -p buzz-db migration_schema_workflow_step_journal --lib --locked -- --ignored
       - name: Verify execution ownership after embedded migrations in a separate empty database
         run: |
           psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE workflow_ownership_migration'
