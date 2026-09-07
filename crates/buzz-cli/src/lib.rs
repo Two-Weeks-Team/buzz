@@ -991,6 +991,21 @@ pub enum WorkflowsCmd {
         #[arg(long, requires = "before")]
         before_id: Option<String>,
     },
+    /// Read durable step attempts; missing returns are not proof of no effects
+    Attempts {
+        /// Workflow UUID
+        #[arg(long)]
+        workflow: String,
+        /// Run UUID
+        #[arg(long)]
+        run: String,
+        /// Page size, 1..32 (default 16)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Next-page index from next.after_index
+        #[arg(long)]
+        after_index: Option<u32>,
+    },
     /// Read durable approval references and decisions for a workflow run
     Approvals {
         /// Workflow UUID

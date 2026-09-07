@@ -410,7 +410,11 @@ buzz workflows trigger --workflow "$WF_ID" | jq .
 
 # workflows runs
 buzz workflows runs --workflow "$WF_ID" | jq .
-# Expected: [] — relay stores runs in DB, not as Nostr events; empty is normal
+# Expected: {"runs":[...],"next":null|{"before":...,"before_id":...}}
+# Read persisted attempted steps for a run returned above (not inferred effects).
+buzz workflows attempts --workflow "$WF_ID" --run "$RUN_ID" --limit 16 | jq .
+# Follow next.after_index with --after-index. A null result means no recorded
+# return, not that the action had no effects. An empty journal can be legacy.
 
 # workflows approve — requires a workflow run waiting for approval
 # This is hard to test ad-hoc without a workflow that has an approval gate.

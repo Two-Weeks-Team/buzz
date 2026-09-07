@@ -85,6 +85,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(api::workflows::run_approvals),
         )
         .route(
+            "/workflows/{workflow_id}/runs/{run_id}/attempts",
+            get(api::workflows::run_attempts),
+        )
+        .route(
             "/operator/communities",
             get(api::operator::list_owned_communities).post(api::operator::provision_community),
         )

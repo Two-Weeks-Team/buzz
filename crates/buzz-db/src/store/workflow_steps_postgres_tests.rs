@@ -36,6 +36,52 @@ async fn exercise_journal() {
         .await
         .unwrap();
     let db = Db::from_pool(pool.clone());
+    let (page_community, page_run) = fixture(&pool).await;
+    let page_workflow = db
+        .get_workflow_run(page_community, page_run)
+        .await
+        .unwrap()
+        .workflow_id;
+    sqlx::query("INSERT INTO workflow_step_attempts(community_id,run_id,step_index,execution_epoch,step_id,action_digest) SELECT $1,$2,i,1,'step_'||i,$3 FROM generate_series(0,34) i")
+        .bind(page_community.as_uuid()).bind(page_run).bind(&[7u8;32][..]).execute(&pool).await.unwrap();
+    let first = db
+        .list_workflow_step_attempts(page_community, page_workflow, page_run, None, 33)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 33);
+    assert_eq!(first[32].step_index, 32);
+    assert!(first[0].result.is_none());
+    let second = db
+        .list_workflow_step_attempts(page_community, page_workflow, page_run, Some(32), 33)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.iter().map(|row| row.step_index).collect::<Vec<_>>(),
+        vec![33, 34]
+    );
+    assert!(db
+        .list_workflow_step_attempts(page_community, Uuid::new_v4(), page_run, None, 33)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_workflow_step_attempts(
+            CommunityId::from_uuid(Uuid::new_v4()),
+            page_workflow,
+            page_run,
+            None,
+            33
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_workflow_step_attempts(page_community, page_workflow, page_run, None, 34)
+        .await
+        .is_err());
+    let encoded = serde_json::to_value(&first[0]).unwrap();
+    assert_eq!(encoded.as_object().unwrap().len(), 7);
+    assert!(!encoded.to_string().contains("token"));
     let fenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='workflow_step_attempts'::regclass AND tgname='community_write_fence_workflow_step_attempts' AND NOT tgisinternal)")
         .fetch_one(&pool).await.unwrap();
     assert!(

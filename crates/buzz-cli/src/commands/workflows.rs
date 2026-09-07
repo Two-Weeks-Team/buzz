@@ -107,6 +107,60 @@ fn runs_path(
     Ok(format!("/workflows/{workflow}/runs?{}", query.finish()))
 }
 
+fn attempts_path(
+    workflow: &str,
+    run: &str,
+    limit: Option<u32>,
+    after: Option<u32>,
+) -> Result<String, CliError> {
+    validate_uuid(workflow)?;
+    validate_uuid(run)?;
+    let limit = limit.unwrap_or(16);
+    if !(1..=32).contains(&limit) || after.is_some_and(|index| index >= 4096) {
+        return Err(CliError::Usage(
+            "limit must be 1..32 and after-index 0..4095".into(),
+        ));
+    }
+    let mut path = format!("/workflows/{workflow}/runs/{run}/attempts?limit={limit}");
+    if let Some(after) = after {
+        path.push_str(&format!("&after_index={after}"));
+    }
+    Ok(path)
+}
+
+/// Read one signed journal page without inferring completion or replay safety.
+pub async fn cmd_get_workflow_attempts(
+    client: &BuzzClient,
+    workflow: &str,
+    run: &str,
+    limit: Option<u32>,
+    after: Option<u32>,
+) -> Result<(), CliError> {
+    let path = attempts_path(workflow, run, limit, after)?;
+    let response = client.get_authed(&path).await?;
+    let value = structured_read(&response, "attempts")?;
+    let expected_workflow = parse_uuid(workflow)?.to_string();
+    let expected_run = parse_uuid(run)?.to_string();
+    let valid_next = match value.get("next") {
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Object(next)) => next
+            .get("after_index")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|index| index < 4096),
+        _ => false,
+    };
+    if value.get("workflow_id").and_then(|v| v.as_str()) != Some(expected_workflow.as_str())
+        || value.get("run_id").and_then(|v| v.as_str()) != Some(expected_run.as_str())
+        || !valid_next
+    {
+        return Err(CliError::Other(
+            "invalid step journal scope or pagination response".into(),
+        ));
+    }
+    println!("{value}");
+    Ok(())
+}
+
 fn structured_read(response: &str, field: &str) -> Result<serde_json::Value, CliError> {
     let value: serde_json::Value = serde_json::from_str(response)
         .map_err(|_| CliError::Other("invalid workflow JSON response".into()))?;
@@ -296,6 +350,14 @@ mod approval_reference_tests {
             serde_json::json!([])
         );
         assert!(structured_read("{\"approvals\":[]}", "approvals").is_ok());
+        assert_eq!(
+            attempts_path(id, id, Some(2), Some(3)).unwrap(),
+            format!("/workflows/{id}/runs/{id}/attempts?limit=2&after_index=3")
+        );
+        assert!(attempts_path(id, id, Some(33), None).is_err());
+        assert!(attempts_path(id, id, None, Some(4096)).is_err());
+        assert!(attempts_path(id, "bad", None, None).is_err());
+        assert!(structured_read("{\"attempts\":null}", "attempts").is_err());
     }
 
     #[test]
@@ -351,6 +413,12 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
         WorkflowsCmd::Approvals { workflow, run } => {
             cmd_get_workflow_approvals(client, &workflow, &run).await
         }
+        WorkflowsCmd::Attempts {
+            workflow,
+            run,
+            limit,
+            after_index,
+        } => cmd_get_workflow_attempts(client, &workflow, &run, limit, after_index).await,
         WorkflowsCmd::Approve {
             token,
             approved,

@@ -40,6 +40,73 @@ fn request_path(path: &str, raw_query: Option<&str>) -> String {
     }
 }
 
+/// Ascending step journal pagination. No cursor means the first page.
+#[derive(Debug, Deserialize, Default)]
+pub struct AttemptsQuery {
+    after_index: Option<i32>,
+    limit: Option<i64>,
+}
+
+/// Authorized read of relay-owned step evidence, not synthetic Nostr events.
+pub async fn run_attempts(
+    State(state): State<Arc<AppState>>,
+    Path((workflow_id, run_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<AttemptsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let limit = query.limit.unwrap_or(16);
+    if !(1..=32).contains(&limit)
+        || query
+            .after_index
+            .is_some_and(|index| !(0..4096).contains(&index))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "limit must be 1..32 and after_index 0..4095",
+        ));
+    }
+    let path = format!("/workflows/{workflow_id}/runs/{run_id}/attempts");
+    let tenant =
+        authorize_workflow_read(&state, &headers, &path, raw_query.as_deref(), workflow_id).await?;
+    let run = state
+        .db
+        .get_workflow_run(tenant.community(), run_id)
+        .await
+        .map_err(|error| match error {
+            buzz_db::error::DbError::NotFound(_) => {
+                api_error(StatusCode::NOT_FOUND, "workflow run not found")
+            }
+            other => internal_error(&format!("get workflow run for journal read: {other}")),
+        })?;
+    if run.workflow_id != workflow_id {
+        return Err(api_error(StatusCode::NOT_FOUND, "workflow run not found"));
+    }
+    let mut attempts = state
+        .db
+        .list_workflow_step_attempts(
+            tenant.community(),
+            workflow_id,
+            run_id,
+            query.after_index,
+            limit + 1,
+        )
+        .await
+        .map_err(|error| internal_error(&format!("list step attempts: {error}")))?;
+    let more = attempts.len() > limit as usize;
+    attempts.truncate(limit as usize);
+    let next = if more {
+        attempts
+            .last()
+            .map(|row| serde_json::json!({"after_index":row.step_index}))
+    } else {
+        None
+    };
+    Ok(Json(
+        serde_json::json!({"workflow_id":workflow_id,"run_id":run_id,"attempts":attempts,"next":next}),
+    ))
+}
+
 async fn authorize_workflow_read(
     state: &Arc<AppState>,
     headers: &HeaderMap,

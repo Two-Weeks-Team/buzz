@@ -7,10 +7,29 @@ mod postgres_tests;
 
 use buzz_core::CommunityId;
 use serde_json::Value;
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{workflow::WorkflowExecutionClaim, Db, DbError, Result};
+
+/// Token-free evidence for one attempted step; a return is not provider proof.
+#[derive(Debug, serde::Serialize)]
+pub struct WorkflowStepAttempt {
+    /// Zero-based immutable step index.
+    pub step_index: i32,
+    /// Execution generation that recorded the intent.
+    pub execution_epoch: i64,
+    /// Definition's step identifier.
+    pub step_id: String,
+    /// SHA-256 digest, hex encoded, of the executor's serialized intent.
+    pub action_digest: String,
+    /// Database time of the intent insert (the write is committed before dispatch).
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Database observation time of an executor return, absent if unconfirmed.
+    pub returned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recorded executor result, never inferred from the run status.
+    pub result: Option<Value>,
+}
 
 async fn lock_execution(
     tx: &mut Transaction<'_, Postgres>,
@@ -33,6 +52,40 @@ async fn lock_execution(
 }
 
 impl Db {
+    /// Read a bounded ascending journal page with explicit tenant/workflow/run
+    /// binding. The extra (33rd) row permits a maximum-32 API page's lookahead.
+    pub async fn list_workflow_step_attempts(
+        &self,
+        community: CommunityId,
+        workflow: Uuid,
+        run: Uuid,
+        after_index: Option<i32>,
+        limit: i64,
+    ) -> Result<Vec<WorkflowStepAttempt>> {
+        let after = after_index.unwrap_or(-1);
+        if !(-1..4096).contains(&after) || !(1..=33).contains(&limit) {
+            return Err(DbError::InvalidData("invalid step journal page".into()));
+        }
+        let rows=sqlx::query("SELECT a.step_index,a.execution_epoch,a.step_id,encode(a.action_digest,'hex') AS action_digest,a.started_at,a.returned_at,a.result
+            FROM workflow_step_attempts a JOIN workflow_runs r ON r.community_id=a.community_id AND r.id=a.run_id
+            WHERE a.community_id=$1 AND r.workflow_id=$2 AND a.run_id=$3 AND a.step_index>$4
+            ORDER BY a.step_index ASC LIMIT $5")
+            .bind(community.as_uuid()).bind(workflow).bind(run).bind(after).bind(limit).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(WorkflowStepAttempt {
+                    step_index: row.try_get("step_index")?,
+                    execution_epoch: row.try_get("execution_epoch")?,
+                    step_id: row.try_get("step_id")?,
+                    action_digest: row.try_get("action_digest")?,
+                    started_at: row.try_get("started_at")?,
+                    returned_at: row.try_get("returned_at")?,
+                    result: row.try_get("result")?,
+                })
+            })
+            .collect()
+    }
+
     /// Commit one step intent before dispatch. Duplicate attempts, including a
     /// later epoch, are denied; callers must not dispatch when false or uncertain.
     /// Store a SHA-256 digest of resolved action bytes, not secret-bearing inputs.
