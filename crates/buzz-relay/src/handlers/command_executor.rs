@@ -1302,30 +1302,45 @@ async fn resume_workflow_after_approval(
         }
     };
 
-    let def: buzz_workflow::WorkflowDef = match serde_json::from_value(workflow.definition.clone())
-    {
-        Ok(d) => d,
+    let snapshot = match run
+        .trigger_context
+        .as_ref()
+        .ok_or_else(|| "missing snapshot".to_string())
+        .and_then(|value| {
+            buzz_workflow::snapshot::ExecutionSnapshot::from_stored(value)
+                .map_err(|e| e.to_string())
+        }) {
+        Ok(snapshot) => snapshot,
         Err(e) => {
-            tracing::error!("resume_workflow: failed to parse workflow definition: {e}");
-            if let Err(db_err) = db
-                .update_workflow_run(
-                    community_id,
-                    run_id,
-                    RunStatus::Failed,
-                    run.current_step,
-                    &run.execution_trace,
-                    Some(buzz_db::workflow::WorkflowRunFailure {
-                        code: "invalid_definition",
-                        message: &format!("definition parse error: {e}"),
-                    }),
-                )
-                .await
-            {
-                tracing::error!("resume_workflow: failed to mark run as failed: {db_err}");
-            }
+            tracing::error!("resume_workflow: refusing missing/invalid snapshot: {e}");
             return;
         }
     };
+    let Some(channel_id) = workflow.channel_id else {
+        return;
+    };
+    if !workflow.enabled
+        || run.workflow_id != workflow_id
+        || snapshot.trigger.channel_id != channel_id.to_string()
+        || snapshot.gate.step_index.checked_add(1) != Some(resume_index)
+        || usize::try_from(run.current_step).ok() != Some(snapshot.gate.step_index)
+    {
+        tracing::warn!("resume_workflow: snapshot/run binding denied");
+        return;
+    }
+    if let Err(e) = engine
+        .check_owner_authority(
+            community_id,
+            channel_id,
+            &workflow.owner_pubkey,
+            &snapshot.definition,
+        )
+        .await
+    {
+        tracing::warn!("resume_workflow: owner authority denied: {e}");
+        return;
+    }
+    let def = snapshot.definition;
 
     // Reconstruct step_outputs from execution trace for template resolution
     let mut initial_outputs: std::collections::HashMap<String, serde_json::Value> =
@@ -1342,11 +1357,7 @@ async fn resume_workflow_after_approval(
     }
 
     // Restore trigger context for {{trigger.*}} templates
-    let trigger_ctx: TriggerContext = run
-        .trigger_context
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let trigger_ctx = snapshot.trigger;
 
     // Execute remaining steps
     let existing_trace = run.execution_trace.as_array().cloned();
@@ -1360,6 +1371,17 @@ async fn resume_workflow_after_approval(
         Some(initial_outputs),
     )
     .await;
+    if matches!(
+        &result,
+        Err((
+            buzz_workflow::WorkflowError::ResumeNotClaimed(_)
+                | buzz_workflow::WorkflowError::CapacityExceeded,
+            _
+        ))
+    ) {
+        tracing::warn!("resume_workflow: no execution claim acquired; preserving durable run");
+        return;
+    }
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;

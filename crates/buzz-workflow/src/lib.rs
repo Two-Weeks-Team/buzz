@@ -34,6 +34,7 @@ pub mod action_sink;
 pub mod error;
 pub mod executor;
 pub mod schema;
+pub mod snapshot;
 
 pub use action_sink::{ActionSink, ActionSinkError};
 pub use error::{PartialProgress, WorkflowError};

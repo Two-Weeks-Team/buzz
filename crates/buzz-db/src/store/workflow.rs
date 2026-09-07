@@ -1315,6 +1315,33 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Claim a granted waiting gate once, preserving its durable trace/context.
+    #[datastore_span(name = "claim_workflow_resume", system = "postgresql")]
+    pub async fn claim_workflow_resume(
+        &self,
+        community: CommunityId,
+        run: Uuid,
+        next_step: i32,
+    ) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE workflow_runs r SET status='running', current_step=$3,
+             started_at=COALESCE(started_at,NOW())
+             WHERE r.community_id=$1 AND r.id=$2 AND r.status='waiting_approval'
+               AND r.current_step + 1 = $3
+               AND EXISTS (SELECT 1 FROM workflow_approvals a
+                 WHERE a.community_id=r.community_id AND a.run_id=r.id
+                   AND a.workflow_id=r.workflow_id AND a.step_index=r.current_step
+                   AND a.status='granted')",
+        )
+        .bind(community.as_uuid())
+        .bind(run)
+        .bind(next_step)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
     /// Store a gate, trace and execution context in one transaction.
     #[datastore_span(name = "suspend_workflow_run", system = "postgresql")]
     pub async fn suspend_workflow_run(
@@ -3054,6 +3081,45 @@ mod postgres_tests {
         assert!(suspend_workflow_run(&pool, wrong, &trace, &context)
             .await
             .is_err());
+        let db = Db::from_pool(pool.clone());
+        assert!(!db
+            .claim_workflow_resume(community, run_id, 2)
+            .await
+            .expect("ungranted"));
+        update_approval(
+            &pool,
+            community,
+            "valid",
+            ApprovalStatus::Granted,
+            None,
+            None,
+        )
+        .await
+        .expect("grant");
+        assert!(!db
+            .claim_workflow_resume(other, run_id, 2)
+            .await
+            .expect("foreign"));
+        assert!(!db
+            .claim_workflow_resume(community, run_id, 3)
+            .await
+            .expect("wrong step"));
+        let (a, b) = tokio::join!(
+            db.claim_workflow_resume(community, run_id, 2),
+            db.claim_workflow_resume(community, run_id, 2)
+        );
+        assert_ne!(
+            a.expect("claim a"),
+            b.expect("claim b"),
+            "exactly one resume wins"
+        );
+        let resumed = get_workflow_run(&pool, community, run_id)
+            .await
+            .expect("resumed");
+        assert_eq!(resumed.status, RunStatus::Running);
+        assert_eq!(resumed.current_step, 2);
+        assert_eq!(resumed.execution_trace, trace);
+        assert_eq!(resumed.trigger_context, suspended.trigger_context);
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------

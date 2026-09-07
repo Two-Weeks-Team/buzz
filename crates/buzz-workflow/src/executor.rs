@@ -1033,6 +1033,8 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
 /// - Resume execution from the correct step after approval.
 #[derive(Debug)]
 pub struct ExecutionResult {
+    /// Typed definition, trigger and resolved gate when suspended.
+    pub snapshot: Option<crate::snapshot::ExecutionSnapshot>,
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
     pub approval_token: Option<String>,
@@ -1127,33 +1129,45 @@ pub async fn execute_from_step(
 
     // Mark run as Running now that we have a permit (resume from approval).
     // Preserve the existing execution trace from pre-approval steps.
-    let existing_trace = match engine.db.get_workflow_run(community_id, run_id).await {
-        Ok(r) => r.execution_trace,
-        Err(e) => {
-            warn!(
-                run_id = %run_id,
-                "Failed to read existing trace for resume — pre-approval trace will be lost: {e}"
-            );
-            serde_json::json!([])
-        }
-    };
-    engine
+    let run = engine
         .db
-        .update_workflow_run(
-            community_id,
-            run_id,
-            buzz_db::workflow::RunStatus::Running,
-            start_index as i32,
-            &existing_trace,
-            None,
-        )
+        .get_workflow_run(community_id, run_id)
         .await
         .map_err(|e| {
             (
-                WorkflowError::from(e),
+                WorkflowError::ResumeNotClaimed(e.to_string()),
                 crate::error::PartialProgress::default(),
             )
         })?;
+    if !run.execution_trace.is_array() {
+        return Err((
+            WorkflowError::ResumeNotClaimed("invalid stored execution trace".into()),
+            crate::error::PartialProgress::default(),
+        ));
+    }
+    let next_step = i32::try_from(start_index).map_err(|_| {
+        (
+            WorkflowError::ResumeNotClaimed("resume index overflow".into()),
+            crate::error::PartialProgress::default(),
+        )
+    })?;
+    let claimed = engine
+        .db
+        .claim_workflow_resume(community_id, run_id, next_step)
+        .await
+        .map_err(|e| {
+            (
+                WorkflowError::ResumeNotClaimed(e.to_string()),
+                crate::error::PartialProgress::default(),
+            )
+        })?;
+
+    if !claimed {
+        return Err((
+            WorkflowError::ResumeNotClaimed("resume gate not granted or already claimed".into()),
+            crate::error::PartialProgress::default(),
+        ));
+    }
 
     execute_steps(
         engine,
@@ -1283,7 +1297,18 @@ async fn execute_steps(
                 );
                 // Return the token and current state so the caller can persist the
                 // approval record and update the run's execution trace.
+                let snapshot =
+                    approval_snapshot(def, trigger_ctx, i, &resolved_action).map_err(|e| {
+                        (
+                            e,
+                            crate::error::PartialProgress {
+                                step_index: i,
+                                trace: trace.clone(),
+                            },
+                        )
+                    })?;
                 return Ok(ExecutionResult {
+                    snapshot: Some(snapshot),
                     approval_token: Some(approval_token),
                     step_index: i,
                     step_outputs,
@@ -1302,6 +1327,7 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
+        snapshot: None,
         approval_token: None,
         step_index: def.steps.len(),
         step_outputs,
@@ -1309,10 +1335,84 @@ async fn execute_steps(
     })
 }
 
+fn approval_snapshot(
+    def: &WorkflowDef,
+    trigger: &TriggerContext,
+    index: usize,
+    resolved: &ActionDef,
+) -> Result<crate::snapshot::ExecutionSnapshot, WorkflowError> {
+    let ActionDef::RequestApproval {
+        from,
+        message,
+        timeout,
+    } = resolved
+    else {
+        return Err(WorkflowError::InvalidDefinition(
+            "suspension from non-approval action".into(),
+        ));
+    };
+    let step = def
+        .steps
+        .get(index)
+        .ok_or_else(|| WorkflowError::InvalidDefinition("approval step missing".into()))?;
+    let snapshot = crate::snapshot::ExecutionSnapshot {
+        definition: def.clone(),
+        trigger: trigger.clone(),
+        gate: crate::snapshot::ApprovalGate {
+            step_index: index,
+            step_id: step.id.clone(),
+            from: from.clone(),
+            message: message.clone(),
+            timeout_secs: parse_duration_secs(timeout.as_deref().unwrap_or("24h"))?,
+        },
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn approval_snapshot_pins_inputs_and_rejects_invalid_resume_context() {
+        let (mut def, _) = crate::schema::parse_yaml("name: snapshot\ntrigger:\n  on: message_posted\nsteps:\n  - id: gate\n    action: request_approval\n    from: '@anyone'\n    message: '{{trigger.text}}'\n    timeout: 1h\n").expect("definition");
+        let mut trigger = make_trigger();
+        let resolved =
+            resolve_step_templates(&def.steps[0], &trigger, &HashMap::new()).expect("resolved");
+        let snapshot = approval_snapshot(&def, &trigger, 0, &resolved).expect("snapshot");
+        def.name = "later edit".into();
+        trigger.text = "later trigger".into();
+        let stored = json!({"buzz_execution_version":1,"snapshot":snapshot});
+        let decoded = crate::snapshot::ExecutionSnapshot::from_stored(&stored).expect("decode");
+        assert_eq!(decoded.definition.name, "snapshot");
+        assert_eq!(decoded.gate.message, decoded.trigger.text);
+        assert_eq!(decoded.gate.timeout_secs, 3600);
+        for invalid in [
+            json!({}),
+            json!({"text":"legacy"}),
+            json!({"buzz_execution_version":2,"snapshot":snapshot}),
+            json!({"buzz_execution_version":1,"snapshot":snapshot,"extra":true}),
+        ] {
+            assert!(crate::snapshot::ExecutionSnapshot::from_stored(&invalid).is_err());
+        }
+        let mut wrong = stored.clone();
+        wrong["snapshot"]["gate"]["step_index"] = json!(99);
+        assert!(crate::snapshot::ExecutionSnapshot::from_stored(&wrong).is_err());
+        wrong = stored.clone();
+        wrong["snapshot"]["gate"]["step_id"] = json!("other");
+        assert!(crate::snapshot::ExecutionSnapshot::from_stored(&wrong).is_err());
+        assert!(approval_snapshot(
+            &def,
+            &trigger,
+            0,
+            &ActionDef::Delay {
+                duration: "1s".into()
+            }
+        )
+        .is_err());
+    }
 
     fn make_trigger() -> TriggerContext {
         TriggerContext {

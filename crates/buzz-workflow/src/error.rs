@@ -49,6 +49,9 @@ pub enum WorkflowError {
     /// The engine's concurrency limit was reached.
     #[error("capacity exceeded")]
     CapacityExceeded,
+    /// Resume failed before owning execution; do not finalize another worker's run.
+    #[error("resume not claimed: {0}")]
+    ResumeNotClaimed(String),
 
     /// A database operation failed.
     #[error("database error: {0}")]
@@ -76,6 +79,7 @@ impl WorkflowError {
             Self::StepTimeout { .. } => "step_timeout",
             Self::WebhookError(_) => "webhook_failed",
             Self::CapacityExceeded => "capacity_exceeded",
+            Self::ResumeNotClaimed(_) => "resume_not_claimed",
             Self::Database(_) => "database_error",
             Self::Unauthorized(_) => "owner_unauthorized",
             Self::NotImplemented(_) => "action_not_implemented",

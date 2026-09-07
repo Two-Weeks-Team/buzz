@@ -56,6 +56,7 @@ jobs:
       - run: node .downstream/check.mjs
       - run: scripts/test-postgres-test-discovery.sh
       - run: cargo test -p buzz-relay channel_authz --lib --locked --no-default-features
+      - run: cargo test -p buzz-workflow --lib --locked --no-default-features
       - name: Initialize only the ephemeral service database
         run: psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/schema.sql
       - run: cargo test -p buzz-db private_invitation_requires_active_channel_admin --lib --locked -- --ignored
