@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, Code, Pencil, X } from "lucide-react";
+import { Check, Code, History, Pencil, X } from "lucide-react";
 import { useBlocker } from "@tanstack/react-router";
 import { stringify as yamlStringify } from "yaml";
 
@@ -31,7 +31,8 @@ import {
   DialogTitle,
 } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
-import { Popover, PopoverContent } from "@/shared/ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
+import { useWorkflowHistoryCapability } from "./useWorkflowHistoryCapability";
 import { ChannelCombobox } from "./ChannelCombobox";
 import { WorkflowActionsMenu } from "./WorkflowActionsMenu";
 import { WorkflowDetailPanel } from "./WorkflowDetailPanel";
@@ -250,6 +251,7 @@ export function WorkflowDialog({
     null,
   );
   const [historyOpen, setHistoryOpen] = React.useState(false);
+  const historySupported = useWorkflowHistoryCapability(open);
   const [channelAutoOpenPending, setChannelAutoOpenPending] = React.useState(
     mode === "create" && !channelId,
   );
@@ -595,22 +597,23 @@ export function WorkflowDialog({
             <div className="flex items-center gap-2">
               {mode === "edit" && workflowSnapshot ? (
                 <>
-                  <Popover onOpenChange={setHistoryOpen} open={historyOpen}>
-                    {/* TODO(workflow-run-history-capability): Restore this
-                    icon-only entry point after Desktop gates it on the active
-                    relay's advertised NIP-11 capabilities.
-                    <PopoverTrigger asChild>
-                      <Button
-                        aria-label="Run history"
-                        className="h-8 w-8"
-                        size="icon"
-                        type="button"
-                        variant={historyOpen ? "secondary" : "outline"}
-                      >
-                        <History className="h-4 w-4" />
-                      </Button>
-                    </PopoverTrigger>
-                    */}
+                  <Popover
+                    onOpenChange={setHistoryOpen}
+                    open={historySupported && historyOpen}
+                  >
+                    {historySupported ? (
+                      <PopoverTrigger asChild>
+                        <Button
+                          aria-label="Run history"
+                          className="h-8 w-8"
+                          size="icon"
+                          type="button"
+                          variant={historyOpen ? "secondary" : "outline"}
+                        >
+                          <History className="h-4 w-4" />
+                        </Button>
+                      </PopoverTrigger>
+                    ) : null}
                     <PopoverContent
                       align="end"
                       aria-label="Run history"

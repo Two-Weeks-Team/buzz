@@ -189,7 +189,8 @@ impl RelayInfo {
             supported_nips.push(NIP_RELAY_MEMBERSHIP);
         }
 
-        let mut supported_extensions = vec!["nip-er".to_string()];
+        let mut supported_extensions =
+            vec!["nip-er".to_string(), "buzz.workflow-history.v1".to_string()];
         let gif = gif_provider.map(|provider| {
             supported_extensions.push("buzz-gif".to_string());
             GifDescriptor {
@@ -476,6 +477,16 @@ mod tests {
         let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, None, None);
         let json = serde_json::to_value(&info).expect("serialize");
         assert!(json.get("pairing_relay_url").is_none());
+    }
+
+    #[test]
+    fn advertises_versioned_workflow_history_reads() {
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, None, None);
+        let json = serde_json::to_value(info).expect("serialize");
+        assert!(json["supported_extensions"]
+            .as_array()
+            .expect("extensions")
+            .contains(&serde_json::json!("buzz.workflow-history.v1")));
     }
 
     #[test]

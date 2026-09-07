@@ -57,6 +57,7 @@ jobs:
       - run: node .downstream/check.mjs
       - run: scripts/test-postgres-test-discovery.sh
       - run: cargo test -p buzz-relay channel_authz --lib --locked --no-default-features
+      - run: cargo test -p buzz-relay nip11::tests --lib --locked --no-default-features
       - run: cargo test -p buzz-workflow --lib --locked --no-default-features
       - run: cargo test -p buzz-cli --lib --locked --no-default-features approval_reference_tests
       - name: Initialize only the ephemeral service database
