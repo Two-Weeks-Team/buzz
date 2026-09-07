@@ -384,8 +384,8 @@ pub async fn lock_member_snapshot(
 /// - Open channels: `invited_by` is optional; role is forced to `Member` regardless of
 ///   what the caller passes — callers cannot self-assign elevated roles.
 /// - Private channels: requires an `invited_by` who is an active member, or the channel
-///   creator bootstrapping their own first membership. Any active member may add an
-///   ordinary member, guest, or bot; only owners/admins may grant elevated roles.
+///   creator bootstrapping their own first membership. This downstream reserves
+///   third-party additions to active channel owners/admins, including ordinary roles.
 /// - Elevated roles (`Owner`, `Admin`) may only be granted by an existing owner/admin,
 ///   even on open channels.
 ///
@@ -438,9 +438,8 @@ pub async fn add_member(
                 DbError::InvalidData(format!("invalid role in database: {inviter_role_str}"))
             })?;
 
-            // Any active member may extend private-channel access with an
-            // ordinary role. Granting owner/admin remains reserved for an
-            // existing owner/admin.
+            // Elevated-role grants have their own diagnostic. The downstream
+            // third-party invitation gate below also covers ordinary roles.
             if role.is_elevated() && !inviter_role.is_elevated() {
                 return Err(DbError::AccessDenied(
                     "only owners/admins may grant elevated roles".to_string(),
@@ -515,6 +514,20 @@ pub async fn add_member(
             if owner_count <= 1 {
                 return Err(DbError::AccessDenied(
                     "cannot demote the last owner — transfer ownership first".to_string(),
+                ));
+            }
+        }
+    }
+
+    // Final authority, under the same membership lock as role changes/removal.
+    // Do not rely only on the relay pre-storage check: other callers use this
+    // writer directly, and an inviter may have been demoted since validation.
+    if channel.visibility == "private" {
+        if let Some(inviter) = invited_by.filter(|inviter| *inviter != pubkey) {
+            let actor_role = get_active_role_tx(&mut tx, community_id, channel_id, inviter).await?;
+            if !matches!(actor_role.as_deref(), Some("owner" | "admin")) {
+                return Err(DbError::AccessDenied(
+                    "only channel owners/admins may add others to private channels".to_string(),
                 ));
             }
         }
@@ -1518,6 +1531,10 @@ impl Db {
         get_member_role(&self.pool, community_id, channel_id, pubkey).await
     }
 }
+
+#[cfg(test)]
+#[path = "channel_invitation_postgres_tests.rs"]
+mod invitation_postgres_tests;
 
 #[cfg(test)]
 mod postgres_tests {

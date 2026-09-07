@@ -1,0 +1,61 @@
+name: Downstream invitation authority
+on:
+  push:
+    branches: ['agentbase/**']
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'schema/**'
+      - 'migrations/**'
+      - 'bin/**'
+      - '.downstream/**'
+      - '.github/workflows/downstream-invitation.yml'
+  pull_request:
+    branches: ['agentbase/main']
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'schema/**'
+      - 'migrations/**'
+      - 'bin/**'
+      - '.downstream/**'
+      - '.github/workflows/downstream-invitation.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  authority:
+    if: github.repository == 'Two-Weeks-Team/buzz'
+    name: Invitation authority regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      BUZZ_TEST_DATABASE_URL: postgres://preflight:isolated-test-only@127.0.0.1:5432/preflight
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: preflight
+          POSTGRES_PASSWORD: isolated-test-only
+          POSTGRES_DB: preflight
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd 'pg_isready -U preflight -d preflight'
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - run: node .downstream/check.mjs
+      - run: scripts/test-postgres-test-discovery.sh
+      - run: cargo test -p buzz-relay channel_authz --lib --locked --no-default-features
+      - name: Initialize only the ephemeral service database
+        run: psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/schema.sql
+      - run: cargo test -p buzz-db private_invitation_requires_active_channel_admin --lib --locked -- --ignored

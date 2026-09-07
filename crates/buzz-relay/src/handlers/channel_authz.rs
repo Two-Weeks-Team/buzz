@@ -31,6 +31,9 @@ pub enum ChannelAuthzError {
     /// Actor tried to change an active member's role without being elevated.
     #[error("only owners/admins may change an active member's role")]
     RoleChangeDenied,
+    /// This downstream's private-channel policy reserves invitations to channel admins.
+    #[error("only channel owners/admins may add others to private channels")]
+    PrivateInvitationDenied,
     /// Demoting the channel's only owner would orphan it.
     #[error("cannot demote the last owner — transfer ownership first")]
     LastOwnerDemotion,
@@ -117,9 +120,8 @@ pub fn decide_put_user(
     actor: &[u8],
 ) -> Result<PutUserDecision, ChannelAuthzError> {
     // Open channels allow any authenticated user; private channels require the
-    // actor to be an existing active member. Any active member may add an
-    // ordinary member, guest, or bot, but only owners/admins may grant an
-    // elevated role.
+    // actor to be an existing active member. The downstream invitation gate
+    // below also reserves third-party private-channel additions to owners/admins.
     if visibility == "private" {
         if actor_role.is_none() {
             return Err(ChannelAuthzError::ActorNotAuthorized);
@@ -158,7 +160,14 @@ pub fn decide_put_user(
         }
     }
 
-    // Self-add: always allowed regardless of the target's agent policy.
+    if visibility == "private"
+        && target != actor
+        && !actor_role.is_some_and(|role| role.is_elevated())
+    {
+        return Err(ChannelAuthzError::PrivateInvitationDenied);
+    }
+
+    // Self-add: allowed for an active actor, regardless of the target's agent policy.
     if target == actor {
         return Ok(PutUserDecision::Allow);
     }
@@ -239,6 +248,33 @@ mod tests {
 
     fn pk(tag: u8) -> Vec<u8> {
         vec![tag; 32]
+    }
+
+    #[test]
+    fn private_invitation_authority_matrix() {
+        use MemberRole::{Admin, Bot, Guest, Member, Owner};
+        for role in [Owner, Admin, Member, Bot, Guest] {
+            let members = roster(&[(1, "owner"), (2, role.as_str()), (3, "member")]);
+            // Both an existing target and a new/removed target need invitation authority.
+            for target in [3, 4] {
+                for requested in [None, Some(Member), Some(Bot), Some(Guest)] {
+                    let result = decide_put_user(
+                        "private",
+                        Some(role),
+                        requested,
+                        &members,
+                        &pk(target),
+                        &pk(2),
+                    );
+                    assert_eq!(result.is_ok(), role.is_elevated());
+                }
+            }
+            assert_eq!(
+                decide_put_user("private", Some(role), None, &members, &pk(2), &pk(2)),
+                Ok(PutUserDecision::Allow),
+                "active self-target remains idempotent for {role:?}",
+            );
+        }
     }
 
     /// A roster literal: `(pubkey_tag, role)` pairs.
@@ -402,7 +438,7 @@ mod tests {
                 Some(Admin),
                 Ok(CheckAddPolicy),
             ),
-            // A plain member may still add an ordinary member to a private channel.
+            // Downstream policy: ordinary members cannot extend private access.
             (
                 "private",
                 &[(1, "owner"), (2, "member")],
@@ -410,7 +446,7 @@ mod tests {
                 Some(Member),
                 5,
                 Some(Member),
-                Ok(CheckAddPolicy),
+                Err(E::PrivateInvitationDenied),
             ),
             // ── Open channels skip both private gates entirely ──
             (
