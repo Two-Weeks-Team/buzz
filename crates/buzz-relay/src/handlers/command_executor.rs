@@ -1207,52 +1207,27 @@ async fn handle_approval_deny(
         ));
     }
 
-    // Commit both records; a failed event commit must not leave a denied token.
+    // Denial, cancellation and the signed command must share one commit. Match
+    // the exact gate under the database write lock, not a post-commit snapshot.
+    let cancel_msg = format!("workflow cancelled: approval denied by {self_hex}");
+    if !buzz_db::workflow::cancel_denied_workflow_run(
+        &mut *tx,
+        tenant.community(),
+        &token_hash,
+        &cancel_msg,
+    )
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: cancel denied run: {e}")))?
+    {
+        return Err(IngestError::Rejected(
+            "invalid: workflow no longer waiting at this approval gate".into(),
+        ));
+    }
+
+    // A failed commit must leave neither a denied token nor a cancelled run.
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
-
-    // 6. Cancel the workflow run (post-commit, async)
-    let community_id = tenant.community();
-    let run_id = approval.run_id;
-    let pubkey_hex = self_hex.clone();
-    let db = state.db.clone();
-
-    tokio::spawn(async move {
-        let run = match db.get_workflow_run(community_id, run_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("approval_deny: failed to fetch run {run_id}: {e}");
-                return;
-            }
-        };
-
-        if run.status != RunStatus::WaitingApproval {
-            tracing::warn!(
-                "approval_deny: run {run_id} has status '{}', expected 'waiting_approval'",
-                run.status
-            );
-            return;
-        }
-
-        let cancel_msg = format!("workflow cancelled: approval denied by {pubkey_hex}");
-        if let Err(e) = db
-            .update_workflow_run(
-                community_id,
-                run_id,
-                RunStatus::Cancelled,
-                run.current_step,
-                &run.execution_trace,
-                Some(buzz_db::workflow::WorkflowRunFailure {
-                    code: "approval_denied",
-                    message: &cancel_msg,
-                }),
-            )
-            .await
-        {
-            tracing::error!("approval_deny: failed to cancel run {run_id}: {e}");
-        }
-    });
 
     // 7. Return response
     Ok(IngestResult {
@@ -1262,7 +1237,7 @@ async fn handle_approval_deny(
             "response:{}",
             serde_json::json!({
                 "status": "denied",
-                "run_id": run_id.to_string(),
+                "run_id": approval.run_id.to_string(),
             })
         ),
     })

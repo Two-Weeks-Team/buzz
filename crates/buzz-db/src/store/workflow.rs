@@ -1064,6 +1064,33 @@ pub async fn suspend_workflow_run(
     Ok(())
 }
 
+/// Cancel only the waiting run at the exact denied gate. Call with the same
+/// transaction as the signed denial and approval decision; a false result must
+/// roll back that transaction rather than acknowledge a stranded denial.
+pub async fn cancel_denied_workflow_run<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    community_id: CommunityId,
+    token_hash: &[u8],
+    message: &str,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        "UPDATE workflow_runs r SET status='cancelled', completed_at=NOW(),
+         error_code='approval_denied', error_message=$3
+         FROM workflow_approvals a
+         WHERE a.community_id=$1 AND a.token=$2 AND a.status='denied'
+           AND r.community_id=a.community_id AND r.id=a.run_id
+           AND r.workflow_id=a.workflow_id AND r.current_step=a.step_index
+           AND r.status='waiting_approval'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(token_hash)
+    .bind(message)
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
 /// Fetch an approval record by raw token.
 ///
 /// The token is hashed before the DB lookup so plaintext tokens are never
@@ -2983,6 +3010,128 @@ mod postgres_tests {
                 .status,
             ApprovalStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_denial_cancels_exact_gate_in_command_transaction() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let foreign = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community, workflow_id, Uuid::new_v4(), "deny-atomic")
+            .await;
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("run");
+        let trace = serde_json::json!([{"step_id":"gate", "output":"preserved"}]);
+        update_workflow_run(
+            &pool,
+            community,
+            run_id,
+            RunStatus::WaitingApproval,
+            2,
+            &trace,
+            None,
+        )
+        .await
+        .expect("waiting fixture");
+        let token = "deny-transaction";
+        create_approval(
+            &pool,
+            CreateApprovalParams {
+                community_id: community,
+                token,
+                workflow_id,
+                run_id,
+                step_id: "gate",
+                step_index: 2,
+                approver_spec: "@anyone",
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+        )
+        .await
+        .expect("approval");
+        let hash = hash_approval_token(token);
+        assert!(
+            !cancel_denied_workflow_run(&pool, community, &hash, "pending")
+                .await
+                .expect("pending cannot cancel")
+        );
+        for commit in [false, true] {
+            let mut tx = pool.begin().await.expect("transaction");
+            assert!(update_approval_by_stored_hash(
+                &mut *tx,
+                community,
+                &hash,
+                ApprovalStatus::Denied,
+                None,
+                None
+            )
+            .await
+            .expect("denial"));
+            assert!(
+                !cancel_denied_workflow_run(&mut *tx, foreign, &hash, "foreign")
+                    .await
+                    .expect("tenant fence")
+            );
+            sqlx::query("UPDATE workflow_runs SET current_step=3 WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await
+                .expect("later gate");
+            assert!(
+                !cancel_denied_workflow_run(&mut *tx, community, &hash, "stale")
+                    .await
+                    .expect("gate fence")
+            );
+            sqlx::query("UPDATE workflow_runs SET current_step=2 WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await
+                .expect("restore gate");
+            assert!(
+                cancel_denied_workflow_run(&mut *tx, community, &hash, "denied")
+                    .await
+                    .expect("cancel")
+            );
+            assert!(
+                !cancel_denied_workflow_run(&mut *tx, community, &hash, "replay")
+                    .await
+                    .expect("terminal fence")
+            );
+            if commit {
+                tx.commit().await.expect("commit");
+            } else {
+                tx.rollback().await.expect("crash before commit");
+            }
+            let run = get_workflow_run(&pool, community, run_id)
+                .await
+                .expect("run");
+            assert_eq!(
+                run.status,
+                if commit {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::WaitingApproval
+                }
+            );
+            assert_eq!(run.execution_trace, trace);
+            assert_eq!(run.current_step, 2);
+            assert_eq!(
+                get_approval(&pool, community, token)
+                    .await
+                    .expect("approval")
+                    .status,
+                if commit {
+                    ApprovalStatus::Denied
+                } else {
+                    ApprovalStatus::Pending
+                }
+            );
+        }
     }
 
     #[tokio::test]
