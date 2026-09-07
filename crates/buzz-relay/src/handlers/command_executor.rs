@@ -1449,6 +1449,25 @@ mod postgres_tests {
             .await
             .expect("run read");
         assert_eq!(run.status, RunStatus::WaitingApproval);
+        // A repeated initial dispatch must neither execute the gate twice nor
+        // let its losing finalizer overwrite the owner's suspended execution.
+        let duplicate =
+            buzz_workflow::executor::execute_run(&engine, community, run_id, &definition, &trigger)
+                .await;
+        assert!(matches!(
+            &duplicate,
+            Err((buzz_workflow::WorkflowError::StartNotClaimed(_), _))
+        ));
+        engine
+            .finalize_run(community, run_id, duplicate, None)
+            .await;
+        let preserved = db
+            .get_workflow_run(community, run_id)
+            .await
+            .expect("preserved run");
+        assert_eq!(preserved.status, RunStatus::WaitingApproval);
+        assert_eq!(preserved.execution_trace, run.execution_trace);
+        assert_eq!(preserved.trigger_context, run.trigger_context);
         let snapshot = buzz_workflow::snapshot::ExecutionSnapshot::from_stored(
             run.trigger_context.as_ref().expect("durable context"),
         )

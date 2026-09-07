@@ -218,6 +218,11 @@ impl WorkflowEngine {
         result: Result<ExecutionResult, (WorkflowError, PartialProgress)>,
         existing_trace: Option<Vec<serde_json::Value>>,
     ) {
+        if matches!(&result, Err((WorkflowError::StartNotClaimed(_), _))) {
+            // A duplicate start is not a failed execution. In particular, do
+            // not overwrite the winner's Running/Waiting/Completed record.
+            return;
+        }
         let prefix = existing_trace.unwrap_or_default();
 
         match result {

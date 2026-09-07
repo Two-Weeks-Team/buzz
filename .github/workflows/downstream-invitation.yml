@@ -64,6 +64,7 @@ jobs:
         run: psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/schema.sql
       - run: cargo test -p buzz-db private_invitation_requires_active_channel_admin --lib --locked -- --ignored
       - run: cargo test -p buzz-db roleless_invitation_reads_role_after_writer_lock --lib --locked -- --ignored
+      - run: cargo test -p buzz-db workflow_initial_claim_is_single_and_preserves_progress --lib --locked -- --ignored
       - run: cargo test -p buzz-db approval_decision_joins_transaction_and_checks_write_time_expiry --lib --locked -- --ignored
       - run: cargo test -p buzz-db approval_denial_cancels_exact_gate_in_command_transaction --lib --locked -- --ignored
       - run: cargo test -p buzz-db approval_suspension_is_atomic_and_fences_duplicate_finalizers --lib --locked -- --ignored

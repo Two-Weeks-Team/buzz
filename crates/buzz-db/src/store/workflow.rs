@@ -795,11 +795,26 @@ pub async fn delete_workflow_for_owner(
 
 // -- Workflow Run CRUD --------------------------------------------------------
 
-/// Insert a new workflow run. Returns the new run's UUID.
-///
-/// `trigger_context` is the serialized `TriggerContext` for this run. It is stored
-/// so that post-approval resume steps can restore the original trigger data and
-/// correctly resolve `{{trigger.*}}` template variables.
+/// Acquire initial execution once without clearing prior trace/context.
+pub async fn claim_workflow_start(
+    pool: &PgPool,
+    community: CommunityId,
+    run: Uuid,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        "UPDATE workflow_runs SET status='running', started_at=COALESCE(started_at,NOW())
+         WHERE community_id=$1 AND id=$2 AND status='pending'
+           AND current_step=0 AND execution_trace='[]'::jsonb",
+    )
+    .bind(community.as_uuid())
+    .bind(run)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// Insert a new run with its original serialized trigger context.
 pub async fn create_workflow_run(
     pool: &PgPool,
     community_id: CommunityId,
@@ -1444,6 +1459,11 @@ impl Db {
                 })
             })
             .collect()
+    }
+
+    /// Claim initial Pending execution once, preserving trace and trigger context.
+    pub async fn claim_workflow_start(&self, community: CommunityId, run: Uuid) -> Result<bool> {
+        claim_workflow_start(&self.pool, community, run).await
     }
 
     /// Claim a granted waiting gate once, preserving its durable trace/context.
@@ -3587,6 +3607,50 @@ mod postgres_tests {
             .expect("claimed scan")
             .iter()
             .any(|row| row.community_id == community && row.run_id == run_id));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn workflow_initial_claim_is_single_and_preserves_progress() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let other = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community, workflow_id, Uuid::new_v4(), "start-claim")
+            .await;
+        let context = serde_json::json!({"text":"original"});
+        let run = create_workflow_run(&pool, community, workflow_id, None, Some(&context))
+            .await
+            .unwrap();
+        assert!(!claim_workflow_start(&pool, other, run).await.unwrap());
+        let (first, second) = tokio::join!(
+            claim_workflow_start(&pool, community, run),
+            claim_workflow_start(&pool, community, run),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let claimed = get_workflow_run(&pool, community, run).await.unwrap();
+        assert_eq!(claimed.status, RunStatus::Running);
+        assert!(claimed.started_at.is_some());
+        assert_eq!(claimed.trigger_context, Some(context.clone()));
+        let trace = serde_json::json!([{"step_id":"done","status":"completed"}]);
+        for status in [
+            RunStatus::Running,
+            RunStatus::WaitingApproval,
+            RunStatus::Completed,
+            RunStatus::Cancelled,
+            RunStatus::Failed,
+            RunStatus::Pending,
+        ] {
+            update_workflow_run(&pool, community, run, status.clone(), 1, &trace, None)
+                .await
+                .unwrap();
+            assert!(!claim_workflow_start(&pool, community, run).await.unwrap());
+            let preserved = get_workflow_run(&pool, community, run).await.unwrap();
+            assert_eq!(preserved.status, status);
+            assert_eq!(preserved.current_step, 1);
+            assert_eq!(preserved.execution_trace, trace);
+            assert_eq!(preserved.trigger_context, Some(context.clone()));
+        }
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------

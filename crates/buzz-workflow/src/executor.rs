@@ -1060,7 +1060,7 @@ pub struct ExecutionResult {
 /// Returns `ExecutionResult` with `approval_token = None` on normal completion.
 ///
 /// Enforces `engine.config.max_concurrent` via a semaphore — returns
-/// [`WorkflowError::CapacityExceeded`] immediately if all permits are taken.
+/// [`WorkflowError::StartNotClaimed`] immediately if all permits are taken.
 /// Transitions the run to `Running` after acquiring a permit.
 pub async fn execute_run(
     engine: &WorkflowEngine,
@@ -1072,28 +1072,28 @@ pub async fn execute_run(
     // Fail fast if all concurrency permits are in use — no queuing.
     let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
         (
-            WorkflowError::CapacityExceeded,
+            WorkflowError::StartNotClaimed("capacity exceeded before initial claim".into()),
             crate::error::PartialProgress::default(),
         )
     })?;
 
-    engine
+    let claimed = engine
         .db
-        .update_workflow_run(
-            community_id,
-            run_id,
-            buzz_db::workflow::RunStatus::Running,
-            0,
-            &serde_json::json!([]),
-            None,
-        )
+        .claim_workflow_start(community_id, run_id)
         .await
         .map_err(|e| {
             (
-                WorkflowError::from(e),
+                WorkflowError::StartNotClaimed(format!("initial claim unavailable: {e}")),
                 crate::error::PartialProgress::default(),
             )
         })?;
+
+    if !claimed {
+        return Err((
+            WorkflowError::StartNotClaimed(run_id.to_string()),
+            crate::error::PartialProgress::default(),
+        ));
+    }
 
     execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
 }

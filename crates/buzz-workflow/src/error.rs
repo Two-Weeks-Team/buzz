@@ -52,6 +52,9 @@ pub enum WorkflowError {
     /// Resume failed before owning execution; do not finalize another worker's run.
     #[error("resume not claimed: {0}")]
     ResumeNotClaimed(String),
+    /// Initial execution was not acquired; never finalize another worker's run.
+    #[error("start not claimed: {0}")]
+    StartNotClaimed(String),
 
     /// A database operation failed.
     #[error("database error: {0}")]
@@ -80,6 +83,7 @@ impl WorkflowError {
             Self::WebhookError(_) => "webhook_failed",
             Self::CapacityExceeded => "capacity_exceeded",
             Self::ResumeNotClaimed(_) => "resume_not_claimed",
+            Self::StartNotClaimed(_) => "start_not_claimed",
             Self::Database(_) => "database_error",
             Self::Unauthorized(_) => "owner_unauthorized",
             Self::NotImplemented(_) => "action_not_implemented",
