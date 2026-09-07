@@ -989,7 +989,10 @@ pub struct CreateApprovalParams<'a> {
 ///
 /// The `token` parameter is the raw (plaintext) token. It is hashed with
 /// SHA-256 before storage so the DB never holds the raw value.
-pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) -> Result<()> {
+pub async fn create_approval<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    params: CreateApprovalParams<'_>,
+) -> Result<()> {
     let CreateApprovalParams {
         community_id,
         token,
@@ -1017,9 +1020,47 @@ pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) ->
     .bind(step_index)
     .bind(approver_spec)
     .bind(expires_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
+    Ok(())
+}
+
+/// Atomically persist an approval gate, prior trace and execution
+/// snapshot before exposing the run as waiting. Only a running run can suspend;
+/// duplicate/stale finalizers cannot replace a gate already awaiting a decision.
+/// `execution_context` is host-produced (definition, trigger and resolved gate),
+/// not a caller-controlled webhook body. The versioned wrapper keeps legacy
+/// trigger_context values distinguishable from resumable snapshots.
+pub async fn suspend_workflow_run(
+    pool: &PgPool,
+    approval: CreateApprovalParams<'_>,
+    trace: &serde_json::Value,
+    execution_context: &serde_json::Value,
+) -> Result<()> {
+    if !trace.is_array() || !execution_context.is_object() || approval.step_index < 0 {
+        return Err(DbError::InvalidData(
+            "invalid approval suspension context".into(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let affected = sqlx::query(
+        "UPDATE workflow_runs SET status='waiting_approval', current_step=$1,
+         execution_trace=$2, trigger_context=jsonb_build_object('buzz_execution_version',1,'snapshot',$3::jsonb)
+         WHERE community_id=$4 AND id=$5 AND workflow_id=$6 AND status='running'
+           AND current_step <= $1 AND $7 > clock_timestamp()",
+    )
+    .bind(approval.step_index).bind(trace).bind(execution_context)
+    .bind(approval.community_id.as_uuid()).bind(approval.run_id).bind(approval.workflow_id)
+    .bind(approval.expires_at)
+    .execute(&mut *tx).await?.rows_affected();
+    if affected != 1 {
+        return Err(DbError::AccessDenied(
+            "workflow is not running at suspension".into(),
+        ));
+    }
+    create_approval(&mut *tx, approval).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1274,6 +1315,17 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Store a gate, trace and execution context in one transaction.
+    #[datastore_span(name = "suspend_workflow_run", system = "postgresql")]
+    pub async fn suspend_workflow_run(
+        &self,
+        approval: CreateApprovalParams<'_>,
+        trace: &serde_json::Value,
+        execution_context: &serde_json::Value,
+    ) -> Result<()> {
+        suspend_workflow_run(&self.pool, approval, trace, execution_context).await
+    }
+
     /// Create a new workflow run.
     #[datastore_span(name = "create_workflow_run", system = "postgresql")]
     pub async fn create_workflow_run(
@@ -2904,6 +2956,104 @@ mod postgres_tests {
                 .status,
             ApprovalStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_suspension_is_atomic_and_fences_duplicate_finalizers() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community, workflow_id, Uuid::new_v4(), "suspension").await;
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("run");
+        let trace =
+            serde_json::json!([{"step_id":"before", "status":"completed", "output":{"value":1}}]);
+        let context = serde_json::json!({"definition":{"steps":[]},"trigger":{"text":"original"}});
+        let params = |token| CreateApprovalParams {
+            community_id: community,
+            token,
+            workflow_id,
+            run_id,
+            step_id: "gate",
+            step_index: 1,
+            approver_spec: "@anyone",
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        };
+        assert!(
+            suspend_workflow_run(&pool, params("pending-denied"), &trace, &context)
+                .await
+                .is_err()
+        );
+        assert!(get_approval(&pool, community, "pending-denied")
+            .await
+            .is_err());
+        update_workflow_run(
+            &pool,
+            community,
+            run_id,
+            RunStatus::Running,
+            0,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("running");
+        create_approval(&pool, params("collision"))
+            .await
+            .expect("collision fixture");
+        assert!(
+            suspend_workflow_run(&pool, params("collision"), &trace, &context)
+                .await
+                .is_err()
+        );
+        let unchanged = get_workflow_run(&pool, community, run_id)
+            .await
+            .expect("run");
+        assert_eq!(unchanged.status, RunStatus::Running);
+        assert_eq!(unchanged.execution_trace, serde_json::json!([]));
+        assert!(unchanged.trigger_context.is_none());
+        let mut expired = params("expired");
+        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(suspend_workflow_run(&pool, expired, &trace, &context)
+            .await
+            .is_err());
+        suspend_workflow_run(&pool, params("valid"), &trace, &context)
+            .await
+            .expect("suspend");
+        let suspended = get_workflow_run(&pool, community, run_id)
+            .await
+            .expect("run");
+        assert_eq!(suspended.status, RunStatus::WaitingApproval);
+        assert_eq!(suspended.current_step, 1);
+        assert_eq!(suspended.execution_trace, trace);
+        assert_eq!(
+            suspended.trigger_context,
+            Some(serde_json::json!({"buzz_execution_version":1,"snapshot":context}))
+        );
+        assert_eq!(
+            get_approval(&pool, community, "valid")
+                .await
+                .expect("approval")
+                .run_id,
+            run_id
+        );
+        assert!(suspend_workflow_run(
+            &pool,
+            params("duplicate"),
+            &serde_json::json!([]),
+            &serde_json::json!({})
+        )
+        .await
+        .is_err());
+        assert!(get_approval(&pool, community, "duplicate").await.is_err());
+        let other = make_community(&pool).await;
+        let mut wrong = params("foreign");
+        wrong.community_id = other;
+        assert!(suspend_workflow_run(&pool, wrong, &trace, &context)
+            .await
+            .is_err());
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------
