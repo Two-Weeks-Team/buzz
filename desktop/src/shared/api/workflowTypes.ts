@@ -56,7 +56,7 @@ export type WorkflowApprovalStatus =
   | "expired";
 
 export type WorkflowApproval = {
-  /** Opaque, non-actionable identifier for display/correlation only. */
+  /** Exact stored hash used for correlation and signed decisions; not a bearer credential. */
   approvalRef: string;
   workflowId: string;
   runId: string;
@@ -77,8 +77,18 @@ export type TriggerWorkflowResponse = {
 };
 
 export type ApprovalActionResponse = {
-  token: string;
-  status: string;
+  approvalRef: string;
+  eventId: string;
+  status: "granted" | "denied";
   runId: string;
   workflowId: string;
+};
+
+export type ApprovalDecisionRequest = {
+  approvalRef: string;
+  workflowId: string;
+  runId: string;
+  expectedRelayUrl: string;
+  expectedSignerPubkey: string;
+  note?: string;
 };

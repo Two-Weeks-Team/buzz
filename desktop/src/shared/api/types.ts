@@ -794,6 +794,7 @@ export type UpdateChannelTemplateInput = {
 
 export type {
   ApprovalActionResponse,
+  ApprovalDecisionRequest,
   Workflow,
   WorkflowApproval,
   WorkflowApprovalStatus,

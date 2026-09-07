@@ -1,6 +1,7 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import type {
   ApprovalActionResponse,
+  ApprovalDecisionRequest,
   TriggerWorkflowResponse,
   Workflow,
   WorkflowApproval,
@@ -86,8 +87,9 @@ type RawTriggerWorkflowResponse = {
 };
 
 type RawApprovalActionResponse = {
-  token: string;
-  status: string;
+  approval_ref: string;
+  event_id: string;
+  status: "granted" | "denied";
   run_id: string;
   workflow_id: string;
 };
@@ -171,9 +173,25 @@ function fromRawTriggerResponse(
 
 function fromRawApprovalResponse(
   raw: RawApprovalActionResponse,
+  request: ApprovalDecisionRequest,
+  expectedStatus: "granted" | "denied",
 ): ApprovalActionResponse {
+  if (
+    !raw ||
+    raw.status !== expectedStatus ||
+    raw.approval_ref !== request.approvalRef.toLowerCase() ||
+    raw.workflow_id !== request.workflowId.toLowerCase() ||
+    raw.run_id !== request.runId.toLowerCase() ||
+    typeof raw.event_id !== "string" ||
+    !/^[0-9a-f]{64}$/.test(raw.event_id)
+  ) {
+    throw new Error(
+      "Approval decision response is unavailable or mismatched. Refresh history before any retry.",
+    );
+  }
   return {
-    token: raw.token,
+    approvalRef: raw.approval_ref,
+    eventId: raw.event_id,
     status: raw.status,
     runId: raw.run_id,
     workflowId: raw.workflow_id,
@@ -276,23 +294,19 @@ export async function triggerWorkflow(
 }
 
 export async function grantApproval(
-  token: string,
-  note?: string,
+  request: ApprovalDecisionRequest,
 ): Promise<ApprovalActionResponse> {
   const raw = await invokeTauri<RawApprovalActionResponse>("grant_approval", {
-    token,
-    note: note ?? null,
+    request: { ...request, note: request.note ?? null },
   });
-  return fromRawApprovalResponse(raw);
+  return fromRawApprovalResponse(raw, request, "granted");
 }
 
 export async function denyApproval(
-  token: string,
-  note?: string,
+  request: ApprovalDecisionRequest,
 ): Promise<ApprovalActionResponse> {
   const raw = await invokeTauri<RawApprovalActionResponse>("deny_approval", {
-    token,
-    note: note ?? null,
+    request: { ...request, note: request.note ?? null },
   });
-  return fromRawApprovalResponse(raw);
+  return fromRawApprovalResponse(raw, request, "denied");
 }

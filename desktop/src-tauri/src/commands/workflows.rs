@@ -330,6 +330,141 @@ pub async fn trigger_workflow(
 
 // ── Approvals ────────────────────────────────────────────────────────────────
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowApprovalDecisionRequest {
+    workflow_id: String,
+    run_id: String,
+    approval_ref: String,
+    expected_relay_url: String,
+    expected_signer_pubkey: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct WorkflowApprovalDecisionWire {
+    approval_ref: String,
+    workflow_id: String,
+    run_id: String,
+    status: String,
+    event_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkflowApprovalDecisionAck {
+    run_id: String,
+    status: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PendingApprovalBinding {
+    approval_ref: String,
+    workflow_id: String,
+    run_id: String,
+    status: String,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(serde::Deserialize)]
+struct PendingApprovalBindings {
+    approvals: Vec<PendingApprovalBinding>,
+}
+
+fn approval_binding_matches(
+    approval: &PendingApprovalBinding,
+    request: &WorkflowApprovalDecisionRequest,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    approval.approval_ref == request.approval_ref
+        && approval.workflow_id == request.workflow_id
+        && approval.run_id == request.run_id
+        && approval.status == "pending"
+        && approval.expires_at > now
+}
+
+fn approval_wire_from_message(
+    request: &WorkflowApprovalDecisionRequest,
+    expected_status: &str,
+    event_id: String,
+    message: &str,
+) -> Result<WorkflowApprovalDecisionWire, String> {
+    let ack: WorkflowApprovalDecisionAck = parse_command_response(message)?;
+    if ack.run_id != request.run_id || ack.status != expected_status {
+        return Err("approval decision response did not match the requested run/action; refresh history before any retry".to_string());
+    }
+    Ok(WorkflowApprovalDecisionWire {
+        approval_ref: request.approval_ref.clone(),
+        workflow_id: request.workflow_id.clone(),
+        run_id: ack.run_id,
+        status: ack.status,
+        event_id,
+    })
+}
+
+async fn submit_approval_decision(
+    mut request: WorkflowApprovalDecisionRequest,
+    granted: bool,
+    state: &AppState,
+) -> Result<WorkflowApprovalDecisionWire, String> {
+    if request.expected_relay_url.trim().is_empty() {
+        return Err("approval decision requires a captured relay scope".to_string());
+    }
+    nostr::PublicKey::from_hex(&request.expected_signer_pubkey)
+        .map_err(|_| "approval decision requires a captured signer public key".to_string())?;
+    request.workflow_id = uuid::Uuid::parse_str(&request.workflow_id)
+        .map_err(|_| "invalid workflow id".to_string())?
+        .to_string();
+    request.run_id = uuid::Uuid::parse_str(&request.run_id)
+        .map_err(|_| "invalid workflow run id".to_string())?
+        .to_string();
+    request.approval_ref = request.approval_ref.to_ascii_lowercase();
+    let builder = if granted {
+        events::build_approval_grant(&request.approval_ref, request.note.as_deref())?
+    } else {
+        events::build_approval_deny(&request.approval_ref, request.note.as_deref())?
+    };
+    // Capture and assert both parts before any await. A community switch may
+    // not retarget the preflight read, signed command, or NIP-98 authentication.
+    let relay_base = crate::relay::relay_api_base_url_with_override(state);
+    let keys = state.signing_keys()?;
+    crate::relay::assert_expected_relay_scope(Some(&request.expected_relay_url), &relay_base)?;
+    crate::relay::assert_expected_signer(
+        Some(&request.expected_signer_pubkey),
+        &keys.public_key().to_hex(),
+    )?;
+    let approvals: PendingApprovalBindings = crate::relay::get_relay_json_at_with_keys(
+        state,
+        &format!(
+            "/workflows/{}/runs/{}/approvals",
+            request.workflow_id, request.run_id
+        ),
+        &relay_base,
+        &keys,
+    )
+    .await?;
+    if approvals
+        .approvals
+        .iter()
+        .filter(|approval| approval_binding_matches(approval, &request, chrono::Utc::now()))
+        .count()
+        != 1
+    {
+        return Err(
+            "exact pending approval is unavailable or expired; refresh history".to_string(),
+        );
+    }
+    // The relay remains authoritative for designated approver, write-time
+    // expiry and duplicate/racing decisions. Never automatically retry a write.
+    let result =
+        crate::relay::submit_event_at_with_keys(builder, state, &relay_base, &keys).await?;
+    approval_wire_from_message(
+        &request,
+        if granted { "granted" } else { "denied" },
+        result.event_id,
+        &result.message,
+    )
+}
+
 #[tauri::command]
 pub async fn get_run_approvals(
     workflow_id: String,
@@ -349,24 +484,18 @@ pub async fn get_run_approvals(
 
 #[tauri::command]
 pub async fn grant_approval(
-    token: String,
-    note: Option<String>,
+    request: WorkflowApprovalDecisionRequest,
     state: State<'_, AppState>,
-) -> Result<Value, String> {
-    let builder = events::build_approval_grant(&token, note.as_deref())?;
-    let result = submit_event(builder, &state).await?;
-    Ok(serde_json::json!({ "event_id": result.event_id }))
+) -> Result<WorkflowApprovalDecisionWire, String> {
+    submit_approval_decision(request, true, &state).await
 }
 
 #[tauri::command]
 pub async fn deny_approval(
-    token: String,
-    note: Option<String>,
+    request: WorkflowApprovalDecisionRequest,
     state: State<'_, AppState>,
-) -> Result<Value, String> {
-    let builder = events::build_approval_deny(&token, note.as_deref())?;
-    let result = submit_event(builder, &state).await?;
-    Ok(serde_json::json!({ "event_id": result.event_id }))
+) -> Result<WorkflowApprovalDecisionWire, String> {
+    submit_approval_decision(request, false, &state).await
 }
 
 // ── Helpers (pure, unit-tested in workflows_tests.rs) ─────────────────────────

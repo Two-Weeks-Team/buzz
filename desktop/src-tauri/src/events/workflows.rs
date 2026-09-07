@@ -37,14 +37,74 @@ pub fn build_workflow_trigger(workflow_id: &str) -> Result<EventBuilder, String>
     Ok(EventBuilder::new(Kind::Custom(46020), "").tags(tags))
 }
 
-/// Kind 46030 — grant an approval token (with optional note).
-pub fn build_approval_grant(token: &str, note: Option<&str>) -> Result<EventBuilder, String> {
-    let tags = vec![tag(vec!["t", token])?];
-    Ok(EventBuilder::new(Kind::Custom(46030), note.unwrap_or("")).tags(tags))
+fn build_approval_decision(
+    approval_ref: &str,
+    note: Option<&str>,
+    kind: u16,
+) -> Result<EventBuilder, String> {
+    if approval_ref.len() != 64 || !approval_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("approval reference must be 64 hexadecimal characters".to_string());
+    }
+    let content = note.unwrap_or("");
+    check_content(content)?;
+    // Structured reads return the stored hash. Do not hash it again or send
+    // the old `t` tag, which the relay decision handler does not consume.
+    let reference = approval_ref.to_ascii_lowercase();
+    let tags = vec![tag(vec!["d", &reference])?];
+    Ok(EventBuilder::new(Kind::Custom(kind), content).tags(tags))
 }
 
-/// Kind 46031 — deny an approval token (with optional note).
-pub fn build_approval_deny(token: &str, note: Option<&str>) -> Result<EventBuilder, String> {
-    let tags = vec![tag(vec!["t", token])?];
-    Ok(EventBuilder::new(Kind::Custom(46031), note.unwrap_or("")).tags(tags))
+/// Kind 46030 — grant an exact stored approval reference.
+pub fn build_approval_grant(
+    approval_ref: &str,
+    note: Option<&str>,
+) -> Result<EventBuilder, String> {
+    build_approval_decision(approval_ref, note, 46030)
+}
+
+/// Kind 46031 — deny an exact stored approval reference.
+pub fn build_approval_deny(approval_ref: &str, note: Option<&str>) -> Result<EventBuilder, String> {
+    build_approval_decision(approval_ref, note, 46031)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_decisions_use_exact_hash_d_tag() {
+        let reference = "AB".repeat(32);
+        for (builder, kind) in [
+            (
+                build_approval_grant(&reference, Some("scoped decision")),
+                46030,
+            ),
+            (
+                build_approval_deny(&reference, Some("scoped decision")),
+                46031,
+            ),
+        ] {
+            let event = builder
+                .unwrap()
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+            event.verify().unwrap();
+            assert_eq!(event.kind, Kind::Custom(kind));
+            assert_eq!(event.content, "scoped decision");
+            let tags: Vec<_> = event.tags.iter().map(|t| t.as_slice()).collect();
+            assert_eq!(
+                tags,
+                vec![vec!["d".to_string(), "ab".repeat(32)].as_slice()]
+            );
+        }
+        for invalid in [
+            "",
+            "token",
+            "12345678-1234-1234-1234-123456789abc",
+            &"z".repeat(64),
+        ] {
+            assert!(build_approval_grant(invalid, None).is_err());
+            assert!(build_approval_deny(invalid, None).is_err());
+        }
+    }
 }

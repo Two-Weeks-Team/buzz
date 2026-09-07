@@ -104,6 +104,14 @@
       "status": "candidate"
     },
     {
+      "id": "desktop-scoped-approval-transport",
+      "summary": "Submit exact approval hashes with captured relay/signer scope and validate durable decision acknowledgements",
+      "paths": ["desktop/src-tauri/src/events/workflows.rs", "desktop/src-tauri/src/commands/workflows.rs", "desktop/src-tauri/src/commands/workflows_tests.rs", "desktop/src-tauri/src/relay/get.rs", "desktop/src/shared/api/tauriWorkflows.ts", "desktop/src/features/workflows/hooks.ts", "desktop/src/shared/api/workflowApprovalDecision.test.mjs"],
+      "tests": ["OPUS_NO_PKG_CONFIG=1 TAURI_CONFIG='{\"bundle\":{\"externalBin\":[]}}' cargo test --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib --locked --no-default-features approval_decision", "cd desktop && node --import ./test-loader.mjs --experimental-strip-types --test src/shared/api/workflowApprovalDecision.test.mjs"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/desktop/src-tauri/src/events/workflows.rs",
+      "status": "candidate"
+    },
+    {
       "id": "approval-snapshot-resume-claim",
       "summary": "Carry typed approval snapshots, reject legacy/default resume context, and claim granted runs once",
       "paths": ["crates/buzz-workflow/src/snapshot.rs", "crates/buzz-workflow/src/executor.rs", "crates/buzz-workflow/src/error.rs", "crates/buzz-workflow/src/lib.rs", "crates/buzz-db/src/store/workflow.rs", "crates/buzz-relay/src/handlers/command_executor.rs"],

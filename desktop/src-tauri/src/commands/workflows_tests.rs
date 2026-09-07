@@ -23,6 +23,165 @@ fn wf_event(d: &str, h: &str, yaml: &str) -> nostr::Event {
 const CHAN: &str = "11111111-1111-1111-1111-111111111111";
 const WF: &str = "22222222-2222-2222-2222-222222222222";
 
+fn approval_request() -> WorkflowApprovalDecisionRequest {
+    WorkflowApprovalDecisionRequest {
+        workflow_id: WF.to_string(),
+        run_id: CHAN.to_string(),
+        approval_ref: "ab".repeat(32),
+        expected_relay_url: "ws://127.0.0.1:63203".to_string(),
+        expected_signer_pubkey: "cd".repeat(32),
+        note: Some("scope only".to_string()),
+    }
+}
+
+/// Explicit opt-in only. The fixture contains run IDs/references, never keys;
+/// the only signing identities are fixed synthetic loopback-lab keys 1 and 3.
+#[tokio::test]
+#[ignore = "requires an explicitly provisioned synthetic relay on 127.0.0.1:63203"]
+async fn desktop_approval_loopback_probe() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        workflow_id: String,
+        run_id: String,
+        approval_ref: String,
+        granted: bool,
+    }
+    let path =
+        std::env::var("BUZZ_DESKTOP_APPROVAL_FIXTURE").expect("explicit fixture file required");
+    let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let owner = Keys::parse(&format!("{:064x}", 1)).unwrap();
+    let member = Keys::parse(&format!("{:064x}", 3)).unwrap();
+    let state = crate::app_state::build_app_state();
+    *state.relay_url_override.lock().unwrap() = Some("ws://127.0.0.1:63203".into());
+    *state.keys.lock().unwrap() = owner.clone();
+    let request = || WorkflowApprovalDecisionRequest {
+        workflow_id: fixture.workflow_id.clone(),
+        run_id: fixture.run_id.clone(),
+        approval_ref: fixture.approval_ref.clone(),
+        expected_relay_url: "ws://127.0.0.1:63203".into(),
+        expected_signer_pubkey: owner.public_key().to_hex(),
+        note: Some("synthetic desktop decision".into()),
+    };
+    let mut wrong = request();
+    wrong.expected_relay_url = "ws://127.0.0.1:63209".into();
+    assert!(submit_approval_decision(wrong, fixture.granted, &state)
+        .await
+        .is_err());
+    let mut wrong = request();
+    wrong.expected_signer_pubkey = member.public_key().to_hex();
+    assert!(submit_approval_decision(wrong, fixture.granted, &state)
+        .await
+        .is_err());
+    let mut wrong = request();
+    wrong.approval_ref = "00".repeat(32);
+    assert!(submit_approval_decision(wrong, fixture.granted, &state)
+        .await
+        .is_err());
+    let mut wrong = request();
+    wrong.run_id = uuid::Uuid::new_v4().to_string();
+    assert!(submit_approval_decision(wrong, fixture.granted, &state)
+        .await
+        .is_err());
+    *state.keys.lock().unwrap() = member.clone();
+    let mut wrong = request();
+    wrong.expected_signer_pubkey = member.public_key().to_hex();
+    assert!(submit_approval_decision(wrong, fixture.granted, &state)
+        .await
+        .is_err());
+    *state.keys.lock().unwrap() = owner.clone();
+    let result = submit_approval_decision(request(), fixture.granted, &state)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        if fixture.granted { "granted" } else { "denied" }
+    );
+    assert_eq!(result.run_id, fixture.run_id);
+    assert!(submit_approval_decision(request(), fixture.granted, &state)
+        .await
+        .is_err());
+    use sha2::Digest;
+    let executable = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    let mut evidence = serde_json::to_value(&result).unwrap();
+    evidence["test_executable_sha256"] = hex::encode(sha2::Sha256::digest(executable)).into();
+    std::fs::write(
+        format!("{path}.result.json"),
+        serde_json::to_vec_pretty(&evidence).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn approval_decision_requires_exact_pending_binding() {
+    let request = approval_request();
+    let now = chrono::Utc::now();
+    let mut approval = PendingApprovalBinding {
+        approval_ref: request.approval_ref.clone(),
+        workflow_id: request.workflow_id.clone(),
+        run_id: request.run_id.clone(),
+        status: "pending".to_string(),
+        expires_at: now + chrono::Duration::seconds(60),
+    };
+    assert!(approval_binding_matches(&approval, &request, now));
+    for field in ["approvalRef", "workflowId", "runId"] {
+        let mut foreign = approval_request();
+        match field {
+            "approvalRef" => foreign.approval_ref = "00".repeat(32),
+            "workflowId" => foreign.workflow_id = CHAN.to_string(),
+            _ => foreign.run_id = WF.to_string(),
+        }
+        assert!(!approval_binding_matches(&approval, &foreign, now));
+    }
+    for status in ["granted", "denied", "expired", "unknown"] {
+        approval.status = status.to_string();
+        assert!(!approval_binding_matches(&approval, &request, now));
+    }
+    approval.status = "pending".to_string();
+    approval.expires_at = now;
+    assert!(!approval_binding_matches(&approval, &request, now));
+}
+
+#[test]
+fn approval_decision_ack_is_not_event_acceptance_or_run_completion() {
+    let request = approval_request();
+    for status in ["granted", "denied"] {
+        let message = format!(
+            "response:{}",
+            serde_json::json!({"run_id": CHAN, "status": status})
+        );
+        let result =
+            approval_wire_from_message(&request, status, "event-id".into(), &message).unwrap();
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["approval_ref"], request.approval_ref);
+        assert_eq!(json["workflow_id"], WF);
+        assert_eq!(json["run_id"], CHAN);
+        assert_eq!(json["status"], status);
+        assert_eq!(json["event_id"], "event-id");
+        assert!(json.get("token").is_none());
+    }
+    for invalid in [
+        "duplicate: already processed".to_string(),
+        "response:{}".to_string(),
+        "response:{\"event_id\":\"accepted-only\"}".to_string(),
+        format!(
+            "response:{}",
+            serde_json::json!({"run_id": WF, "status":"granted"})
+        ),
+        format!(
+            "response:{}",
+            serde_json::json!({"run_id": CHAN, "status":"denied"})
+        ),
+        format!(
+            "response:{}",
+            serde_json::json!({"run_id": CHAN, "status":"completed"})
+        ),
+    ] {
+        assert!(
+            approval_wire_from_message(&request, "granted", "event-id".into(), &invalid).is_err()
+        );
+    }
+}
+
 const YAML: &str = "\
 name: Greet on join
 description: Says hi

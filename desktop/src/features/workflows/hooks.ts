@@ -2,6 +2,7 @@ import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { WorkflowRun, WorkflowRunStatus } from "@/shared/api/types";
+import type { ApprovalDecisionRequest } from "@/shared/api/workflowTypes";
 import {
   useAppFocused,
   useFocusedRefetchInterval,
@@ -231,15 +232,16 @@ export function useApprovalMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (input: {
-      token: string;
+    retry: false,
+    mutationFn: ({
+      action,
+      ...request
+    }: ApprovalDecisionRequest & {
       action: "grant" | "deny";
-      note?: string;
-    }) =>
-      input.action === "grant"
-        ? grantApproval(input.token, input.note)
-        : denyApproval(input.token, input.note),
-    onSuccess: (_data, _variables) => {
+    }) => (action === "grant" ? grantApproval(request) : denyApproval(request)),
+    // A transport error may follow a committed decision. Refresh, do not
+    // synthesize a status or automatically repeat the mutation.
+    onSettled: () => {
       void queryClient.invalidateQueries({
         predicate: (query) =>
           query.queryKey[0] === "workflow-runs" ||

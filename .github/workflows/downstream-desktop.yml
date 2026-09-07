@@ -21,5 +21,20 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
         working-directory: desktop
-      - run: node --import ./test-loader.mjs --experimental-strip-types --test src/features/workflows/ui/approvalTrace.test.mjs src/features/workflows/ui/useWorkflowHistoryCapability.test.mjs
+      - run: node --import ./test-loader.mjs --experimental-strip-types --test src/features/workflows/ui/approvalTrace.test.mjs src/features/workflows/ui/useWorkflowHistoryCapability.test.mjs src/shared/api/workflowApprovalDecision.test.mjs
         working-directory: desktop
+  native-approval:
+    if: github.repository == 'Two-Weeks-Team/buzz'
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      OPUS_NO_PKG_CONFIG: '1'
+      # Unit tests do not package the six release sidecars. Product config stays unchanged.
+      TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib --locked --no-default-features approval_decision
