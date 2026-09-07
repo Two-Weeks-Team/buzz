@@ -1,0 +1,21 @@
+name: Downstream metadata
+on:
+  push:
+    branches: ['agentbase/**']
+  pull_request:
+    branches: ['agentbase/main']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  metadata:
+    if: github.repository == 'Two-Weeks-Team/buzz'
+    name: Downstream metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: node .downstream/check.mjs
