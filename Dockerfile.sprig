@@ -16,7 +16,8 @@ RUN apk add --no-cache \
       protoc
 WORKDIR /build
 COPY . .
-RUN cargo build --locked --profile sprig -p sprig \
+ARG CARGO_BUILD_JOBS=2
+RUN CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --locked --profile sprig -p sprig \
     && strip target/sprig/sprig
 
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
