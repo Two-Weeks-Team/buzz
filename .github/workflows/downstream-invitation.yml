@@ -59,3 +59,4 @@ jobs:
       - name: Initialize only the ephemeral service database
         run: psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/schema.sql
       - run: cargo test -p buzz-db private_invitation_requires_active_channel_admin --lib --locked -- --ignored
+      - run: cargo test -p buzz-db roleless_invitation_reads_role_after_writer_lock --lib --locked -- --ignored

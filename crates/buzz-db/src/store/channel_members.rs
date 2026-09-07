@@ -399,6 +399,37 @@ pub async fn add_member(
     role: MemberRole,
     invited_by: Option<&[u8]>,
 ) -> Result<MemberRecord> {
+    add_member_with_role(
+        pool,
+        community_id,
+        channel_id,
+        pubkey,
+        Some(role),
+        invited_by,
+    )
+    .await
+}
+
+/// Add/reactivate a member without changing an active member's role.
+/// The role is resolved under the same lock as promotion, demotion and removal.
+pub async fn add_member_preserving_role(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    invited_by: Option<&[u8]>,
+) -> Result<MemberRecord> {
+    add_member_with_role(pool, community_id, channel_id, pubkey, None, invited_by).await
+}
+
+async fn add_member_with_role(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    requested_role: Option<MemberRole>,
+    invited_by: Option<&[u8]>,
+) -> Result<MemberRecord> {
     if pubkey.len() != 32 {
         return Err(DbError::InvalidData(format!(
             "pubkey must be 32 bytes, got {}",
@@ -418,6 +449,16 @@ pub async fn add_member(
     acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
 
     let channel = get_channel_tx(&mut tx, community_id, channel_id).await?;
+
+    let role = match requested_role {
+        Some(role) => role,
+        None => match get_active_role_tx(&mut tx, community_id, channel_id, pubkey).await? {
+            Some(role) => role
+                .parse()
+                .map_err(|_| DbError::InvalidData(format!("invalid role in database: {role}")))?,
+            None => MemberRole::Member,
+        },
+    };
 
     let effective_role = if channel.visibility == "private" {
         let inviter = invited_by.ok_or_else(|| {
@@ -1352,6 +1393,18 @@ impl Db {
             invited_by,
         )
         .await
+    }
+
+    /// Add/reactivate a member, preserving an active role under the writer lock.
+    #[datastore_span(name = "add_member_preserving_role", system = "postgresql")]
+    pub async fn add_member_preserving_role(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+        invited_by: Option<&[u8]>,
+    ) -> Result<MemberRecord> {
+        add_member_preserving_role(&self.pool, community_id, channel_id, pubkey, invited_by).await
     }
 
     /// Removes a member from a channel.

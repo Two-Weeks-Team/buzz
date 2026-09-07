@@ -14,6 +14,14 @@
       "tests": ["cargo test -p buzz-relay channel_authz --lib --locked --no-default-features", "cargo test -p buzz-db private_invitation_requires_active_channel_admin --lib --locked -- --ignored"],
       "upstream_reference": "https://github.com/block/buzz/pull/4612",
       "status": "candidate"
+    },
+    {
+      "id": "roleless-invitation-lock",
+      "summary": "Resolve omitted membership role under the membership writer lock, preserving concurrent role changes",
+      "paths": ["crates/buzz-relay/src/handlers/side_effects.rs", "crates/buzz-db/src/store/channel_members.rs", "crates/buzz-db/src/store/channel_invitation_postgres_tests.rs"],
+      "tests": ["cargo test -p buzz-db roleless_invitation_reads_role_after_writer_lock --lib --locked -- --ignored"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/crates/buzz-relay/src/handlers/side_effects.rs",
+      "status": "candidate"
     }
   ]
 }
