@@ -963,6 +963,19 @@ pub async fn update_workflow_run(
     Ok(())
 }
 
+/// A durable granted gate awaiting its single execution claim.
+#[derive(Debug)]
+pub struct GrantedWorkflowResume {
+    /// Owning tenant, taken from the stored run rather than a caller.
+    pub community_id: CommunityId,
+    /// Run to resume.
+    pub run_id: Uuid,
+    /// Workflow bound to the run and approval.
+    pub workflow_id: Uuid,
+    /// Approved zero-based step index.
+    pub step_index: i32,
+}
+
 // -- Approval CRUD ------------------------------------------------------------
 
 /// Parameters for creating a new approval request.
@@ -1342,6 +1355,41 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Scan at most 32 granted waiting runs after a tenant/run keyset cursor.
+    /// Host recovery only: this cross-tenant inventory does not authorize any
+    /// effect. The caller must revalidate authority and atomically claim each
+    /// run. Paging past invalid rows prevents them starving later valid gates.
+    pub async fn list_granted_workflow_resumes(
+        &self,
+        after: Option<(Uuid, Uuid)>,
+    ) -> Result<Vec<GrantedWorkflowResume>> {
+        let rows = sqlx::query(
+            "SELECT r.community_id, r.id, r.workflow_id, r.current_step
+             FROM workflow_runs r
+             WHERE r.status='waiting_approval'
+               AND ($1::uuid IS NULL OR (r.community_id,r.id)>($1,$2))
+               AND EXISTS (SELECT 1 FROM workflow_approvals a
+                 WHERE a.community_id=r.community_id AND a.run_id=r.id
+                   AND a.workflow_id=r.workflow_id AND a.step_index=r.current_step
+                   AND a.status='granted')
+             ORDER BY r.community_id,r.id LIMIT 32",
+        )
+        .bind(after.map(|value| value.0))
+        .bind(after.map(|value| value.1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(GrantedWorkflowResume {
+                    community_id: CommunityId::from_uuid(row.try_get("community_id")?),
+                    run_id: row.try_get("id")?,
+                    workflow_id: row.try_get("workflow_id")?,
+                    step_index: row.try_get("current_step")?,
+                })
+            })
+            .collect()
+    }
+
     /// Claim a granted waiting gate once, preserving its durable trace/context.
     #[datastore_span(name = "claim_workflow_resume", system = "postgresql")]
     pub async fn claim_workflow_resume(
@@ -3231,6 +3279,13 @@ mod postgres_tests {
             .await
             .is_err());
         let db = Db::from_pool(pool.clone());
+        let cursor = Some((*community.as_uuid(), Uuid::nil()));
+        assert!(!db
+            .list_granted_workflow_resumes(cursor)
+            .await
+            .expect("pending scan")
+            .iter()
+            .any(|row| row.community_id == community && row.run_id == run_id));
         assert!(!db
             .claim_workflow_resume(community, run_id, 2)
             .await
@@ -3245,6 +3300,23 @@ mod postgres_tests {
         )
         .await
         .expect("grant");
+        let recovered = db
+            .list_granted_workflow_resumes(cursor)
+            .await
+            .expect("restart scan");
+        let candidate = recovered
+            .iter()
+            .find(|row| row.community_id == community && row.run_id == run_id)
+            .expect("committed grant recovered without notification");
+        assert_eq!(candidate.workflow_id, workflow_id);
+        assert_eq!(candidate.step_index, 1);
+        assert!(recovered.len() <= 32);
+        assert!(!db
+            .list_granted_workflow_resumes(Some((*community.as_uuid(), run_id)))
+            .await
+            .expect("keyset scan")
+            .iter()
+            .any(|row| row.community_id == community && row.run_id == run_id));
         assert!(!db
             .claim_workflow_resume(other, run_id, 2)
             .await
@@ -3269,6 +3341,12 @@ mod postgres_tests {
         assert_eq!(resumed.current_step, 2);
         assert_eq!(resumed.execution_trace, trace);
         assert_eq!(resumed.trigger_context, suspended.trigger_context);
+        assert!(!db
+            .list_granted_workflow_resumes(cursor)
+            .await
+            .expect("claimed scan")
+            .iter()
+            .any(|row| row.community_id == community && row.run_id == run_id));
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------

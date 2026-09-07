@@ -720,6 +720,10 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // Start the cron loop AFTER the action sink is wired.
     let wf_cron = Arc::clone(&workflow_engine);
     tokio::spawn(async move { wf_cron.run().await });
+    tokio::spawn(buzz_relay::workflow_recovery::run(
+        Arc::clone(&workflow_engine),
+        state.db.clone(),
+    ));
 
     // Ephemeral channel reaper — archives channels whose TTL deadline has passed.
     // Runs every 60s, matching the workflow cron loop pattern. The SQL UPDATE
