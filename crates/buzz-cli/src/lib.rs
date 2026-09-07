@@ -984,6 +984,21 @@ pub enum WorkflowsCmd {
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
+        /// Next-page timestamp from the preceding response's next.before
+        #[arg(long, requires = "before_id")]
+        before: Option<String>,
+        /// Next-page UUID from the preceding response's next.before_id
+        #[arg(long, requires = "before")]
+        before_id: Option<String>,
+    },
+    /// Read durable approval references and decisions for a workflow run
+    Approvals {
+        /// Workflow UUID
+        #[arg(long)]
+        workflow: String,
+        /// Run UUID
+        #[arg(long)]
+        run: String,
     },
     /// Approve or deny a workflow step
     #[command(
@@ -2382,7 +2397,17 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "workflows"),
-            vec!["approve", "create", "delete", "get", "list", "runs", "trigger", "update"]
+            vec![
+                "approvals",
+                "approve",
+                "create",
+                "delete",
+                "get",
+                "list",
+                "runs",
+                "trigger",
+                "update"
+            ]
         );
         assert_eq!(names(&cmd, "feed"), vec!["get"]);
         assert_eq!(
@@ -2480,7 +2505,7 @@ mod tests {
             ("social", 7),
             ("upload", 1),
             ("users", 5),
-            ("workflows", 8),
+            ("workflows", 9),
         ];
 
         let cmd = Cli::command();

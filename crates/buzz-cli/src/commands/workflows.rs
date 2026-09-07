@@ -57,40 +57,78 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
     Ok(())
 }
 
-/// Get workflow run history — query kinds [46001, 46002, 46003].
-///
-/// NOTE: The relay does not currently emit workflow execution events (46001-46003).
-/// Run history is stored in the workflow_runs DB table, not as Nostr events.
-/// This command will return an empty array until the relay adds event emission
-/// or a dedicated REST endpoint for run history.
+/// Read a page of durable runs, preserving the relay's `runs`/`next` envelope.
 pub async fn cmd_get_workflow_runs(
     client: &BuzzClient,
     workflow_id: &str,
     limit: Option<u32>,
+    before: Option<&str>,
+    before_id: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_uuid(workflow_id)?;
-    let limit = limit.unwrap_or(20).min(100);
-    let filter = serde_json::json!({
-        "kinds": [46001, 46002, 46003],
-        "#d": [workflow_id],
-        "limit": limit
-    });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let normalized: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "event_id": e.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "kind": e.get("kind").and_then(|v| v.as_u64()).unwrap_or(0),
-                "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-                "tags": e.get("tags").cloned().unwrap_or(serde_json::json!([])),
-            })
-        })
-        .collect();
-    let output = serde_json::to_string(&normalized).unwrap_or_default();
-    println!("{output}");
+    let path = runs_path(workflow_id, limit, before, before_id)?;
+    let response = client.get_authed(&path).await?;
+    let value = structured_read(&response, "runs")?;
+    if !matches!(
+        value.get("next"),
+        Some(serde_json::Value::Null | serde_json::Value::Object(_))
+    ) {
+        return Err(CliError::Other(
+            "invalid workflow pagination response".into(),
+        ));
+    }
+    println!("{value}");
+    Ok(())
+}
+
+fn runs_path(
+    workflow: &str,
+    limit: Option<u32>,
+    before: Option<&str>,
+    before_id: Option<&str>,
+) -> Result<String, CliError> {
+    validate_uuid(workflow)?;
+    let limit = limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) || before.is_some() != before_id.is_some() {
+        return Err(CliError::Usage(
+            "limit must be 1..100; --before and --before-id must be supplied together".into(),
+        ));
+    }
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("limit", &limit.to_string());
+    if let (Some(before), Some(id)) = (before, before_id) {
+        chrono::DateTime::parse_from_rfc3339(before).map_err(|_| {
+            CliError::Usage("--before must be an RFC3339 timestamp from next.before".into())
+        })?;
+        validate_uuid(id)?;
+        query
+            .append_pair("before", before)
+            .append_pair("before_id", id);
+    }
+    Ok(format!("/workflows/{workflow}/runs?{}", query.finish()))
+}
+
+fn structured_read(response: &str, field: &str) -> Result<serde_json::Value, CliError> {
+    let value: serde_json::Value = serde_json::from_str(response)
+        .map_err(|_| CliError::Other("invalid workflow JSON response".into()))?;
+    if !value.get(field).is_some_and(serde_json::Value::is_array) {
+        return Err(CliError::Other(format!("missing workflow {field} array")));
+    }
+    Ok(value)
+}
+
+/// Read durable approval references and decisions for an exact workflow/run.
+pub async fn cmd_get_workflow_approvals(
+    client: &BuzzClient,
+    workflow: &str,
+    run: &str,
+) -> Result<(), CliError> {
+    validate_uuid(workflow)?;
+    validate_uuid(run)?;
+    let response = client
+        .get_authed(&format!("/workflows/{workflow}/runs/{run}/approvals"))
+        .await?;
+    let value = structured_read(&response, "approvals")?;
+    println!("{value}");
     Ok(())
 }
 
@@ -235,6 +273,32 @@ mod approval_reference_tests {
     use super::*;
 
     #[test]
+    fn durable_reads_reject_missing_data_and_validate_pagination() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let timestamp = "2026-09-07T10:12:30.123456+09:00";
+        let path = runs_path(id, Some(1), Some(timestamp), Some(id)).expect("page path");
+        let url = url::Url::parse(&format!("http://localhost{path}")).expect("url");
+        assert!(url
+            .query_pairs()
+            .any(|(key, value)| key == "before" && value == timestamp));
+        for limit in [0, 101] {
+            assert!(runs_path(id, Some(limit), None, None).is_err());
+        }
+        assert!(runs_path(id, None, Some(timestamp), None).is_err());
+        assert!(runs_path(id, None, Some("bad"), Some(id)).is_err());
+        assert!(runs_path("not-uuid", None, None, None).is_err());
+        for invalid in ["", "{}", "[]", "{\"runs\":null}", "{\"runs\":{}}"] {
+            assert!(structured_read(invalid, "runs").is_err());
+        }
+        assert_eq!(
+            structured_read("{\"runs\":[],\"next\":null}", "runs").expect("empty successful page")
+                ["runs"],
+            serde_json::json!([])
+        );
+        assert!(structured_read("{\"approvals\":[]}", "approvals").is_ok());
+    }
+
+    #[test]
     fn preserves_read_reference_and_legacy_token_contract() {
         let reference = "AB".repeat(32);
         assert_eq!(
@@ -269,8 +333,23 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
         WorkflowsCmd::Trigger { workflow, inputs } => {
             cmd_trigger_workflow(client, &workflow, inputs.as_deref()).await
         }
-        WorkflowsCmd::Runs { workflow, limit } => {
-            cmd_get_workflow_runs(client, &workflow, limit).await
+        WorkflowsCmd::Runs {
+            workflow,
+            limit,
+            before,
+            before_id,
+        } => {
+            cmd_get_workflow_runs(
+                client,
+                &workflow,
+                limit,
+                before.as_deref(),
+                before_id.as_deref(),
+            )
+            .await
+        }
+        WorkflowsCmd::Approvals { workflow, run } => {
+            cmd_get_workflow_approvals(client, &workflow, &run).await
         }
         WorkflowsCmd::Approve {
             token,
