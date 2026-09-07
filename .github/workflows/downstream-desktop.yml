@@ -21,7 +21,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
         working-directory: desktop
-      - run: node --import ./test-loader.mjs --experimental-strip-types --test src/features/workflows/ui/approvalTrace.test.mjs src/features/workflows/ui/approvalAction.test.mjs src/features/workflows/ui/useWorkflowHistoryCapability.test.mjs src/shared/api/workflowApprovalDecision.test.mjs
+      - run: node --import ./test-loader.mjs --experimental-strip-types --test src/features/workflows/ui/approvalTrace.test.mjs src/features/workflows/ui/approvalAction.test.mjs src/features/workflows/ui/workflowExecution.test.mjs src/features/workflows/ui/useWorkflowHistoryCapability.test.mjs src/shared/api/workflowApprovalDecision.test.mjs
         working-directory: desktop
   native-approval:
     if: github.repository == 'Two-Weeks-Team/buzz'

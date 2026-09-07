@@ -37,6 +37,7 @@ export type TraceEntry = {
 };
 
 export type WorkflowRun = {
+  execution?: WorkflowExecutionObservation | null;
   id: string;
   workflowId: string;
   status: WorkflowRunStatus;
@@ -47,6 +48,19 @@ export type WorkflowRun = {
   errorCode: string | null;
   errorMessage: string | null;
   createdAt: number;
+};
+
+export type WorkflowExecutionObservation = {
+  state:
+    | "not_started"
+    | "leased"
+    | "outcome_unknown"
+    | "legacy_unowned"
+    | "waiting_approval"
+    | "settled";
+  epoch: number;
+  leaseExpiresAt: string | null;
+  observedAt: string;
 };
 
 export type WorkflowApprovalStatus =

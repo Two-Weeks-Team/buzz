@@ -1,4 +1,5 @@
 import { invokeTauri } from "@/shared/api/tauri";
+import { parseExecutionObservation } from "./workflowExecution";
 import type {
   ApprovalActionResponse,
   ApprovalDecisionRequest,
@@ -40,6 +41,7 @@ type RawTraceEntry = {
 };
 
 type RawWorkflowRun = {
+  execution?: unknown;
   id: string;
   workflow_id: string;
   status: WorkflowRun["status"];
@@ -132,6 +134,7 @@ function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
 
 function fromRawWorkflowRun(raw: RawWorkflowRun): WorkflowRun {
   return {
+    execution: parseExecutionObservation(raw.execution),
     id: raw.id,
     workflowId: raw.workflow_id,
     status: raw.status,

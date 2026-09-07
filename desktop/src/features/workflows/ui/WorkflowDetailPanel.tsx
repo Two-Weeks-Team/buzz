@@ -9,6 +9,8 @@ import {
   useWorkflowRunsQuery,
 } from "@/features/workflows/hooks";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
+import { WorkflowExecutionNotice } from "./WorkflowExecutionNotice";
+import { executionPresentation } from "@/shared/api/workflowExecution";
 import type { Workflow } from "@/shared/api/types";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { useCommunities } from "@/features/communities/useCommunities";
@@ -298,7 +300,14 @@ export function WorkflowDetailPanel({
                                 <span className="truncate font-mono text-xs font-medium">
                                   {run.id.slice(0, 8)}
                                 </span>
-                                <RunStatusBadge status={run.status} />
+                                <RunStatusBadge
+                                  status={
+                                    run.status === "running"
+                                      ? executionPresentation(run, Date.now())
+                                          .label
+                                      : run.status
+                                  }
+                                />
                               </div>
                               <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 pl-6 text-2xs text-muted-foreground">
                                 <span>
@@ -330,6 +339,13 @@ export function WorkflowDetailPanel({
 
                         {isSelected ? (
                           <div className="border-t border-border/60 bg-background/60 px-4 py-4">
+                            <WorkflowExecutionNotice
+                              run={run}
+                              refreshing={runsQuery.isFetching}
+                              onRefresh={() => {
+                                void runsQuery.refetch();
+                              }}
+                            />
                             <div className="mb-3 flex items-center gap-2 text-2xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
                               <span>Execution Trace</span>
                               {approvalsQuery.isFetching ? (
