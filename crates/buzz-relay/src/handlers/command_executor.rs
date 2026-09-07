@@ -97,7 +97,8 @@ enum PersistResult {
 /// not strictly atomic: if a mutation succeeds but commit fails, the mutation
 /// persists without the event record. On retry, the event INSERT succeeds
 /// (no conflict), and the mutation re-executes — which is safe for idempotent
-/// operations (open_dm, hide_dm, update_approval, upsert_workflow).
+/// operations (open_dm, hide_dm, upsert_workflow). Approval decisions instead
+/// use this transaction's executor, so decision and signed command are atomic.
 #[datastore_span(name = "persist_command_event", system = "postgresql")]
 async fn persist_command_event(
     db: &buzz_db::Db,
@@ -1060,8 +1061,8 @@ async fn handle_approval_grant(
     // 4. Validate caller is authorized approver
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
+    // Persist the signed command and approval decision together.
+    let mut tx = match persist_command_event(&state.db, tenant, event, None).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -1079,17 +1080,16 @@ async fn handle_approval_grant(
         Some(event.content.as_str())
     };
 
-    let updated = state
-        .db
-        .update_approval_by_stored_hash(
-            tenant.community(),
-            &token_hash,
-            ApprovalStatus::Granted,
-            Some(&self_bytes),
-            note,
-        )
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
+    let updated = buzz_db::workflow::update_approval_by_stored_hash(
+        &mut *tx,
+        tenant.community(),
+        &token_hash,
+        ApprovalStatus::Granted,
+        Some(&self_bytes),
+        note,
+    )
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
 
     if !updated {
         return Err(IngestError::Rejected(
@@ -1097,7 +1097,7 @@ async fn handle_approval_grant(
         ));
     }
 
-    // Finalize the idempotency record after the separate approval update succeeds.
+    // Commit the signed event and decision together; either both survive or neither.
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
@@ -1171,8 +1171,8 @@ async fn handle_approval_deny(
     // 4. Validate caller is authorized approver
     check_approver_spec(&approval.approver_spec, &self_hex)?;
 
-    // Persist the command event — returns open transaction
-    let tx = match persist_command_event(&state.db, tenant, event, None).await? {
+    // Persist the signed command and approval decision together.
+    let mut tx = match persist_command_event(&state.db, tenant, event, None).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {
                 event_id: event.id.to_hex(),
@@ -1190,17 +1190,16 @@ async fn handle_approval_deny(
         Some(event.content.as_str())
     };
 
-    let updated = state
-        .db
-        .update_approval_by_stored_hash(
-            tenant.community(),
-            &token_hash,
-            ApprovalStatus::Denied,
-            Some(&self_bytes),
-            note,
-        )
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
+    let updated = buzz_db::workflow::update_approval_by_stored_hash(
+        &mut *tx,
+        tenant.community(),
+        &token_hash,
+        ApprovalStatus::Denied,
+        Some(&self_bytes),
+        note,
+    )
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: db update_approval: {e}")))?;
 
     if !updated {
         return Err(IngestError::Rejected(
@@ -1208,7 +1207,7 @@ async fn handle_approval_deny(
         ));
     }
 
-    // Finalize the idempotency record after the separate approval denial succeeds.
+    // Commit both records; a failed event commit must not leave a denied token.
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;

@@ -1129,9 +1129,11 @@ pub async fn update_approval(
 ///
 /// See [`update_approval`] for TOCTOU safety notes. The predicate binds the
 /// server-resolved community alongside the token so an approval action for A/X
-/// can never act on B/X.
-pub async fn update_approval_by_stored_hash(
-    pool: &PgPool,
+/// can never act on B/X. Pass the command's open transaction executor to commit
+/// its signed event and approval decision atomically. Expiry is checked at the
+/// write boundary, not only against a preceding application read.
+pub async fn update_approval_by_stored_hash<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     community_id: CommunityId,
     token_hash: &[u8],
     status: ApprovalStatus,
@@ -1148,6 +1150,7 @@ pub async fn update_approval_by_stored_hash(
             granted_at      = CASE WHEN $4 = 'granted' THEN NOW() ELSE granted_at END,
             denied_at       = CASE WHEN $5 = 'denied'  THEN NOW() ELSE denied_at  END
         WHERE community_id = $6 AND token = $7 AND status = 'pending'
+          AND ($1 NOT IN ('granted', 'denied') OR expires_at > clock_timestamp())
         "#,
     )
     .bind(&status_str)
@@ -1157,7 +1160,7 @@ pub async fn update_approval_by_stored_hash(
     .bind(&status_str) // for denied_at CASE
     .bind(community_id.as_uuid())
     .bind(token_hash)
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
 
@@ -2765,6 +2768,141 @@ mod postgres_tests {
             after_b.status,
             ApprovalStatus::Pending,
             "B's approval must remain pending after A is granted"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_decision_joins_transaction_and_checks_write_time_expiry() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        insert_workflow_with_ids(
+            &pool,
+            community,
+            workflow_id,
+            Uuid::new_v4(),
+            "atomic-approval",
+        )
+        .await;
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("run");
+        for status in [ApprovalStatus::Granted, ApprovalStatus::Denied] {
+            let token = format!("atomic-{}", Uuid::new_v4());
+            create_approval(
+                &pool,
+                CreateApprovalParams {
+                    community_id: community,
+                    token: &token,
+                    workflow_id,
+                    run_id,
+                    step_id: "gate",
+                    step_index: 0,
+                    approver_spec: "@anyone",
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                },
+            )
+            .await
+            .expect("approval");
+            let hash = hash_approval_token(&token);
+            let mut tx = pool.begin().await.expect("transaction");
+            assert!(update_approval_by_stored_hash(
+                &mut *tx,
+                community,
+                &hash,
+                status.clone(),
+                None,
+                Some("candidate")
+            )
+            .await
+            .expect("decision"));
+            tx.rollback().await.expect("simulate failed command commit");
+            assert_eq!(
+                get_approval(&pool, community, &token)
+                    .await
+                    .expect("after rollback")
+                    .status,
+                ApprovalStatus::Pending
+            );
+            // A successful decision and companion write commit as one unit.
+            let mut tx = pool.begin().await.expect("transaction");
+            sqlx::query("UPDATE workflow_runs SET current_step=7 WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await
+                .expect("companion write");
+            assert!(update_approval_by_stored_hash(
+                &mut *tx,
+                community,
+                &hash,
+                status.clone(),
+                None,
+                None
+            )
+            .await
+            .expect("decision"));
+            tx.commit().await.expect("commit");
+            assert_eq!(
+                get_approval(&pool, community, &token)
+                    .await
+                    .expect("after commit")
+                    .status,
+                status
+            );
+            assert_eq!(
+                get_workflow_run(&pool, community, run_id)
+                    .await
+                    .expect("run")
+                    .current_step,
+                7
+            );
+            assert!(!update_approval_by_stored_hash(
+                &pool,
+                community,
+                &hash,
+                ApprovalStatus::Granted,
+                None,
+                None
+            )
+            .await
+            .expect("replay conflict"));
+        }
+        let token = "already-expired-at-write";
+        create_approval(
+            &pool,
+            CreateApprovalParams {
+                community_id: community,
+                token,
+                workflow_id,
+                run_id,
+                step_id: "expired",
+                step_index: 1,
+                approver_spec: "@anyone",
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            },
+        )
+        .await
+        .expect("expired fixture");
+        for status in [ApprovalStatus::Granted, ApprovalStatus::Denied] {
+            assert!(!update_approval_by_stored_hash(
+                &pool,
+                community,
+                &hash_approval_token(token),
+                status,
+                None,
+                None
+            )
+            .await
+            .expect("expired decision"));
+        }
+        assert_eq!(
+            get_approval(&pool, community, token)
+                .await
+                .expect("unchanged")
+                .status,
+            ApprovalStatus::Pending
         );
     }
 
