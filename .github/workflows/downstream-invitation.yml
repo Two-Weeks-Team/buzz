@@ -66,4 +66,5 @@ jobs:
       - run: cargo test -p buzz-db approval_decision_joins_transaction_and_checks_write_time_expiry --lib --locked -- --ignored
       - run: cargo test -p buzz-db approval_denial_cancels_exact_gate_in_command_transaction --lib --locked -- --ignored
       - run: cargo test -p buzz-db approval_suspension_is_atomic_and_fences_duplicate_finalizers --lib --locked -- --ignored
+      - run: cargo test -p buzz-db approval_expiry_preserves_decisions_and_exact_waiting_gate --lib --locked -- --ignored
       - run: cargo test -p buzz-relay native_executor_finalizer_persists_queryable_approval_gate --lib --locked --no-default-features -- --ignored

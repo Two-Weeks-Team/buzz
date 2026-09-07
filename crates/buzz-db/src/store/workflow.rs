@@ -1355,6 +1355,54 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Atomically expire at most 32 overdue pending gates and cancel their exact
+    /// waiting runs. Locks approvals first, matching signed decision ordering;
+    /// concurrent workers skip locked gates and never overwrite granted tokens.
+    pub async fn expire_workflow_approvals(&self) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT a.community_id,a.token,a.run_id,a.workflow_id,a.step_index
+             FROM workflow_approvals a
+             WHERE a.status='pending' AND a.expires_at <= clock_timestamp()
+               AND EXISTS (SELECT 1 FROM workflow_runs r
+                 WHERE r.community_id=a.community_id AND r.id=a.run_id
+                   AND r.workflow_id=a.workflow_id AND r.current_step=a.step_index
+                   AND r.status='waiting_approval')
+             ORDER BY a.expires_at,a.community_id,a.token
+             LIMIT 32 FOR UPDATE OF a SKIP LOCKED",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut expired = 0;
+        for row in rows {
+            let community: Uuid = row.try_get("community_id")?;
+            let token: Vec<u8> = row.try_get("token")?;
+            let run: Uuid = row.try_get("run_id")?;
+            let workflow: Uuid = row.try_get("workflow_id")?;
+            let step: i32 = row.try_get("step_index")?;
+            let changed = sqlx::query(
+                "UPDATE workflow_runs SET status='cancelled',completed_at=NOW(),
+                 error_code='approval_expired',error_message='approval deadline elapsed'
+                 WHERE community_id=$1 AND id=$2 AND workflow_id=$3
+                   AND current_step=$4 AND status='waiting_approval'",
+            )
+            .bind(community)
+            .bind(run)
+            .bind(workflow)
+            .bind(step)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if changed == 1 {
+                sqlx::query("UPDATE workflow_approvals SET status='expired' WHERE community_id=$1 AND token=$2 AND status='pending'")
+                    .bind(community).bind(token).execute(&mut *tx).await?;
+                expired += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(expired)
+    }
+
     /// Scan at most 32 granted waiting runs after a tenant/run keyset cursor.
     /// Host recovery only: this cross-tenant inventory does not authorize any
     /// effect. The caller must revalidate authority and atomically claim each
@@ -3179,6 +3227,129 @@ mod postgres_tests {
                     ApprovalStatus::Pending
                 }
             );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_expiry_preserves_decisions_and_exact_waiting_gate() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community, workflow, Uuid::new_v4(), "expiry").await;
+        let db = Db::from_pool(pool.clone());
+        let trace = serde_json::json!([{"step_id":"gate","message":"keep"}]);
+        let mut fixtures = Vec::new();
+        for kind in ["expired", "future", "granted", "other-step"] {
+            let run = create_workflow_run(&pool, community, workflow, None, None)
+                .await
+                .expect("run");
+            update_workflow_run(
+                &pool,
+                community,
+                run,
+                RunStatus::WaitingApproval,
+                if kind == "other-step" { 1 } else { 0 },
+                &trace,
+                None,
+            )
+            .await
+            .expect("waiting");
+            let token = format!("expiry-{kind}-{}", Uuid::new_v4());
+            create_approval(
+                &pool,
+                CreateApprovalParams {
+                    community_id: community,
+                    token: &token,
+                    workflow_id: workflow,
+                    run_id: run,
+                    step_id: "gate",
+                    step_index: 0,
+                    approver_spec: "any",
+                    expires_at: Utc::now() + chrono::Duration::hours(1),
+                },
+            )
+            .await
+            .expect("approval");
+            if kind == "granted" {
+                assert!(update_approval(
+                    &pool,
+                    community,
+                    &token,
+                    ApprovalStatus::Granted,
+                    None,
+                    None
+                )
+                .await
+                .expect("grant"));
+            }
+            if kind != "future" {
+                sqlx::query("UPDATE workflow_approvals SET expires_at=NOW()-interval '1 second' WHERE community_id=$1 AND token=$2")
+                    .bind(community.as_uuid()).bind(hash_approval_token(&token)).execute(&pool).await.expect("expired fixture");
+            }
+            fixtures.push((kind, run, token));
+        }
+        let mut decision = pool.begin().await.expect("decision lock");
+        sqlx::query(
+            "SELECT token FROM workflow_approvals WHERE community_id=$1 AND token=$2 FOR UPDATE",
+        )
+        .bind(community.as_uuid())
+        .bind(hash_approval_token(&fixtures[0].2))
+        .fetch_one(&mut *decision)
+        .await
+        .expect("lock");
+        db.expire_workflow_approvals()
+            .await
+            .expect("skip in-flight decision");
+        assert_eq!(
+            get_approval(&pool, community, &fixtures[0].2)
+                .await
+                .expect("locked gate")
+                .status,
+            ApprovalStatus::Pending
+        );
+        decision.rollback().await.expect("release lock");
+        let (first, second) = tokio::join!(
+            db.expire_workflow_approvals(),
+            db.expire_workflow_approvals()
+        );
+        first.expect("first worker");
+        second.expect("second worker");
+        for (kind, run, token) in fixtures {
+            let stored = get_workflow_run(&pool, community, run).await.expect("run");
+            assert_eq!(stored.execution_trace, trace);
+            assert_eq!(
+                stored.status,
+                if kind == "expired" {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::WaitingApproval
+                }
+            );
+            let approval = get_approval(&pool, community, &token)
+                .await
+                .expect("approval");
+            assert_eq!(
+                approval.status,
+                match kind {
+                    "expired" => ApprovalStatus::Expired,
+                    "granted" => ApprovalStatus::Granted,
+                    _ => ApprovalStatus::Pending,
+                }
+            );
+            if kind == "expired" {
+                assert_eq!(stored.error_code.as_deref(), Some("approval_expired"));
+                assert!(!update_approval(
+                    &pool,
+                    community,
+                    &token,
+                    ApprovalStatus::Granted,
+                    None,
+                    None
+                )
+                .await
+                .expect("late grant denied"));
+            }
         }
     }
 

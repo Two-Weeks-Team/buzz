@@ -10,6 +10,10 @@ use std::sync::Arc;
 pub async fn run(engine: Arc<buzz_workflow::WorkflowEngine>, db: buzz_db::Db) {
     let mut cursor = None;
     loop {
+        if let Err(error) = db.expire_workflow_approvals().await {
+            // Keep the durable pending gates for a later bounded retry.
+            tracing::error!("Workflow approval expiry failed: {error}");
+        }
         let rows = match db.list_granted_workflow_resumes(cursor).await {
             Ok(rows) => rows,
             Err(error) => {
