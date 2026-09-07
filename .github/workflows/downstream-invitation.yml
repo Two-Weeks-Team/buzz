@@ -59,6 +59,7 @@ jobs:
       - run: cargo test -p buzz-relay channel_authz --lib --locked --no-default-features
       - run: cargo test -p buzz-relay nip11::tests --lib --locked --no-default-features
       - run: cargo test -p buzz-workflow --lib --locked --no-default-features
+      - run: cargo test -p buzz-db --lib --locked
       - run: cargo test -p buzz-cli --lib --locked --no-default-features approval_reference_tests
       - name: Initialize only the ephemeral service database
         run: psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f schema/schema.sql
@@ -70,6 +71,7 @@ jobs:
       - run: cargo test -p buzz-db scheduled_run_transaction_rolls_back_and_deduplicates --lib --locked -- --ignored
       - run: cargo test -p buzz-db workflow_execution_fences_expiry_and_stale_completion --lib --locked -- --ignored
       - run: cargo test -p buzz-db workflow_execution_resume_rotates_ownership --lib --locked -- --ignored
+      - run: cargo test -p buzz-db execution_observation_is_bounded_token_free_and_conservative --lib --locked -- --ignored
       - name: Verify execution ownership after embedded migrations in a separate empty database
         run: |
           psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE workflow_ownership_migration'

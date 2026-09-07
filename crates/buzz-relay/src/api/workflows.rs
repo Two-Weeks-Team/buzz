@@ -202,6 +202,7 @@ fn run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
         "id": run.id,
         "workflow_id": run.workflow_id,
         "status": run.status,
+        "execution": run.execution,
         "current_step": run.current_step,
         "execution_trace": run.execution_trace,
         "started_at": run.started_at.map(|value| value.timestamp()),

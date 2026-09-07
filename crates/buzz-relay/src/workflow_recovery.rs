@@ -4,6 +4,40 @@
 
 use std::sync::Arc;
 
+/// Classify expired owned runs without executing anything. Independent of long
+/// recovery pages; each mutation is bounded and rechecks token/epoch/deadline.
+pub async fn observe_execution_expiry(db: buzz_db::Db) {
+    let mut cursor = None;
+    loop {
+        match db.list_expired_workflow_executions(cursor).await {
+            Ok(rows) => {
+                cursor = rows
+                    .last()
+                    .map(|row| (*row.community_id.as_uuid(), row.run_id));
+                for row in rows {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        db.mark_workflow_execution_uncertain(
+                            row.community_id,
+                            row.run_id,
+                            row.claim,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        result => {
+                            tracing::warn!(run_id=%row.run_id,"Execution expiry observation not confirmed: {result:?}")
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::error!("Execution expiry inventory failed: {error}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
 /// Recover only never-claimed dispatches using their original versioned inputs.
 /// A separate bounded worker prevents approval execution from blocking this scan.
 pub async fn run_pending(engine: Arc<buzz_workflow::WorkflowEngine>, db: buzz_db::Db) {

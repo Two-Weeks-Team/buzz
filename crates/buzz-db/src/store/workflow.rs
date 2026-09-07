@@ -189,9 +189,24 @@ pub struct WorkflowRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Token-free execution observation, evaluated against the database clock.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkflowExecutionObservation {
+    /// not_started, leased, outcome_unknown, legacy_unowned, waiting_approval or settled.
+    pub state: String,
+    /// Monotonic execution generation, not an authority token.
+    pub epoch: i64,
+    /// Deadline of the observed lease, if one exists.
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    /// Database observation time; this is not a permanent liveness guarantee.
+    pub observed_at: DateTime<Utc>,
+}
+
 /// A single execution of a workflow.
 #[derive(Debug, Clone)]
 pub struct WorkflowRunRecord {
+    /// Token-free ownership observation. Missing data is not proof of liveness.
+    pub execution: Option<WorkflowExecutionObservation>,
     /// Unique run identifier.
     pub id: Uuid,
     /// Server-resolved community this run (and its workflow) belongs to.
@@ -863,7 +878,9 @@ pub async fn get_workflow_run(
     let row = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
-               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at
+               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at,
+               execution_token IS NOT NULL AS execution_owned, execution_epoch, execution_lease_until,
+               execution_uncertain, clock_timestamp() AS execution_observed_at
         FROM workflow_runs
         WHERE community_id = $1 AND id = $2
         "#,
@@ -895,7 +912,9 @@ pub async fn list_workflow_runs_page(
     let rows = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
-               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at
+               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at,
+               execution_token IS NOT NULL AS execution_owned, execution_epoch, execution_lease_until,
+               execution_uncertain, clock_timestamp() AS execution_observed_at
         FROM workflow_runs
         WHERE community_id = $1 AND workflow_id = $2
           AND (
@@ -997,6 +1016,17 @@ pub struct WorkflowExecutionClaim {
     pub token: Uuid,
     /// Monotonically increasing per-run generation.
     pub epoch: i64,
+}
+
+/// Host-only candidate for conservative expired ownership observation.
+#[derive(Debug)]
+pub struct ExpiredWorkflowExecution {
+    /// Stored tenant scope.
+    pub community_id: CommunityId,
+    /// Stored run identifier.
+    pub run_id: Uuid,
+    /// Internal ownership token; never serialize in user-visible history.
+    pub claim: WorkflowExecutionClaim,
 }
 
 /// A never-claimed initial dispatch candidate; inventory does not authorize execution.
@@ -1344,8 +1374,27 @@ fn row_to_run_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
 
     let status_str: String = row.try_get("status")?;
     let status = status_str.parse::<RunStatus>()?;
+    let observed_at: DateTime<Utc> = row.try_get("execution_observed_at")?;
+    let lease: Option<DateTime<Utc>> = row.try_get("execution_lease_until")?;
+    let owned: bool = row.try_get("execution_owned")?;
+    let uncertain: bool = row.try_get("execution_uncertain")?;
+    let state = match status {
+        RunStatus::Running if uncertain => "outcome_unknown",
+        RunStatus::Running if !owned => "legacy_unowned",
+        RunStatus::Running if lease.is_some_and(|deadline| deadline > observed_at) => "leased",
+        RunStatus::Running => "outcome_unknown",
+        RunStatus::Pending => "not_started",
+        RunStatus::WaitingApproval => "waiting_approval",
+        _ => "settled",
+    };
 
     Ok(WorkflowRunRecord {
+        execution: Some(WorkflowExecutionObservation {
+            state: state.into(),
+            epoch: row.try_get("execution_epoch")?,
+            lease_expires_at: lease,
+            observed_at,
+        }),
         id,
         community_id: CommunityId::from_uuid(community_id),
         workflow_id,
@@ -1416,6 +1465,28 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Bounded keyset inventory; never returns legacy/unowned or renewed runs.
+    /// Mutation must recheck the exact token, epoch and DB deadline after scanning.
+    pub async fn list_expired_workflow_executions(
+        &self,
+        after: Option<(Uuid, Uuid)>,
+    ) -> Result<Vec<ExpiredWorkflowExecution>> {
+        let rows = sqlx::query("SELECT community_id,id,execution_token,execution_epoch FROM workflow_runs WHERE status='running' AND execution_token IS NOT NULL AND NOT execution_uncertain AND execution_lease_until<=clock_timestamp() AND ($1::uuid IS NULL OR (community_id,id)>($1,$2)) ORDER BY community_id,id LIMIT 32")
+            .bind(after.map(|v| v.0)).bind(after.map(|v| v.1)).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ExpiredWorkflowExecution {
+                    community_id: CommunityId::from_uuid(row.try_get("community_id")?),
+                    run_id: row.try_get("id")?,
+                    claim: WorkflowExecutionClaim {
+                        token: row.try_get("execution_token")?,
+                        epoch: row.try_get("execution_epoch")?,
+                    },
+                })
+            })
+            .collect()
+    }
+
     /// Atomically suspend only the exact live execution owner with its gate.
     pub async fn suspend_owned_workflow_run(
         &self,
@@ -2407,6 +2478,7 @@ mod postgres_tests {
         let trigger_event_id = vec![0xde, 0xad, 0xbe, 0xef];
 
         let record = WorkflowRunRecord {
+            execution: None,
             id,
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id,
@@ -2438,6 +2510,7 @@ mod postgres_tests {
     fn workflow_run_record_no_trigger_event() {
         let now = Utc::now();
         let record = WorkflowRunRecord {
+            execution: None,
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
@@ -2462,6 +2535,7 @@ mod postgres_tests {
     fn workflow_run_record_failed_with_error_message() {
         let now = Utc::now();
         let record = WorkflowRunRecord {
+            execution: None,
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
@@ -2494,6 +2568,7 @@ mod postgres_tests {
         ]);
 
         let record = WorkflowRunRecord {
+            execution: None,
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
@@ -2517,6 +2592,7 @@ mod postgres_tests {
     fn workflow_run_record_clone_is_independent() {
         let now = Utc::now();
         let record = WorkflowRunRecord {
+            execution: None,
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
@@ -4390,6 +4466,130 @@ mod postgres_tests {
             .unwrap();
         Db::from_pool(pool).migrate().await.unwrap();
         assert_execution_fences().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn execution_observation_is_bounded_token_free_and_conservative() {
+        let pool = PgPool::connect(&crate::test_support::database_url())
+            .await
+            .unwrap();
+        let community = make_community(&pool).await;
+        let workflow = Uuid::new_v4();
+        insert_workflow_with_ids(
+            &pool,
+            community,
+            workflow,
+            Uuid::new_v4(),
+            "observed-execution",
+        )
+        .await;
+        let db = Db::from_pool(pool.clone());
+        let mut expired = Vec::new();
+        for _ in 0..35 {
+            let run = create_workflow_run(&pool, community, workflow, None, None)
+                .await
+                .unwrap();
+            let before = db
+                .get_workflow_run(community, run)
+                .await
+                .unwrap()
+                .execution
+                .unwrap();
+            assert_eq!(before.state, "not_started");
+            let claim = db
+                .claim_workflow_execution(community, run, Uuid::new_v4(), None)
+                .await
+                .unwrap()
+                .unwrap();
+            let live = db
+                .get_workflow_run(community, run)
+                .await
+                .unwrap()
+                .execution
+                .unwrap();
+            assert_eq!(live.state, "leased");
+            assert_eq!(live.epoch, 1);
+            assert!(live.lease_expires_at.unwrap() > live.observed_at);
+            let serialized = serde_json::to_string(&live).unwrap();
+            assert!(!serialized.contains("token"));
+            assert!(!serialized.contains(&claim.token.to_string()));
+            sqlx::query("UPDATE workflow_runs SET execution_lease_until=clock_timestamp()-interval '1 second' WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid()).bind(run).execute(&pool).await.unwrap();
+            assert_eq!(
+                db.get_workflow_run(community, run)
+                    .await
+                    .unwrap()
+                    .execution
+                    .unwrap()
+                    .state,
+                "outcome_unknown"
+            );
+            expired.push(run);
+        }
+        let legacy = create_workflow_run(&pool, community, workflow, None, None)
+            .await
+            .unwrap();
+        assert!(claim_workflow_start(&pool, community, legacy)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_workflow_run(community, legacy)
+                .await
+                .unwrap()
+                .execution
+                .unwrap()
+                .state,
+            "legacy_unowned"
+        );
+        let live = create_workflow_run(&pool, community, workflow, None, None)
+            .await
+            .unwrap();
+        db.claim_workflow_execution(community, live, Uuid::new_v4(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cursor = Some((*community.as_uuid(), Uuid::nil()));
+        let mut observed = Vec::new();
+        loop {
+            let rows = db.list_expired_workflow_executions(cursor).await.unwrap();
+            assert!(rows.len() <= 32);
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows
+                .last()
+                .map(|row| (*row.community_id.as_uuid(), row.run_id));
+            for row in rows {
+                if row.community_id != community {
+                    continue;
+                }
+                assert!(![legacy, live].contains(&row.run_id));
+                let (first, second) = tokio::join!(
+                    db.mark_workflow_execution_uncertain(community, row.run_id, row.claim),
+                    db.mark_workflow_execution_uncertain(community, row.run_id, row.claim)
+                );
+                assert_ne!(first.unwrap(), second.unwrap());
+                observed.push(row.run_id);
+            }
+            if cursor.unwrap().0 != *community.as_uuid() {
+                break;
+            }
+        }
+        expired.sort();
+        observed.sort();
+        assert_eq!(expired, observed);
+        let page = db
+            .list_workflow_runs(community, workflow, 100)
+            .await
+            .unwrap();
+        assert!(page
+            .iter()
+            .filter(|row| expired.contains(&row.id))
+            .all(
+                |row| row.execution.as_ref().unwrap().state == "outcome_unknown"
+                    && row.status == RunStatus::Running
+            ));
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------
