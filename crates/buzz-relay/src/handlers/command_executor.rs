@@ -958,14 +958,12 @@ async fn handle_workflow_trigger(
             }
         };
 
-        let result = buzz_workflow::executor::execute_from_step(
+        let result = buzz_workflow::executor::execute_run(
             &engine,
             community_id,
             run_id,
             &def,
             &trigger_ctx_clone,
-            0,
-            None,
         )
         .await;
         engine

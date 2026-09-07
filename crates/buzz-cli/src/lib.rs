@@ -987,11 +987,11 @@ pub enum WorkflowsCmd {
     },
     /// Approve or deny a workflow step
     #[command(
-        after_help = "Examples:\n  buzz workflows approve --token <UUID>\n  buzz workflows approve --token <UUID> --approved false --note \"needs revision\""
+        after_help = "Examples:\n  buzz workflows approve --approval-ref <HEX_FROM_APPROVAL_READ>\n  buzz workflows approve --approval-ref <HEX> --approved false --note \"needs revision\"\n  buzz workflows approve --token <LEGACY_UUID>"
     )]
     Approve {
-        /// The approval token UUID (from the approval request)
-        #[arg(long)]
+        /// Hashed approval reference from structured reads, or legacy token UUID
+        #[arg(long, visible_alias = "approval-ref")]
         token: String,
         /// Approve (true) or deny (false) the step
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]

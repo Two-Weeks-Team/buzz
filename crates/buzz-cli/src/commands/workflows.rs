@@ -209,12 +209,8 @@ pub async fn cmd_approve_step(
     approved: bool,
     note: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_uuid(approval_token)?;
-
     let content = note.unwrap_or("");
-
-    // The relay expects d-tag = hex(SHA256(token)), not the raw token UUID.
-    let token_hash = hex::encode(Sha256::digest(approval_token.as_bytes()));
+    let token_hash = approval_reference(approval_token)?;
     let builder =
         buzz_sdk::build_workflow_approval(&token_hash, approved, content).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
@@ -222,6 +218,38 @@ pub async fn cmd_approve_step(
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
+}
+
+fn approval_reference(value: &str) -> Result<String, CliError> {
+    // Structured approval reads expose an already-hashed reference. Do not hash
+    // it again. Retain legacy raw UUID token support for existing callers.
+    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(value.to_ascii_lowercase());
+    }
+    validate_uuid(value)?;
+    Ok(hex::encode(Sha256::digest(value.as_bytes())))
+}
+
+#[cfg(test)]
+mod approval_reference_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_read_reference_and_legacy_token_contract() {
+        let reference = "AB".repeat(32);
+        assert_eq!(
+            approval_reference(&reference).expect("reference"),
+            reference.to_lowercase()
+        );
+        let token = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(
+            approval_reference(token).expect("legacy"),
+            hex::encode(Sha256::digest(token.as_bytes()))
+        );
+        for malformed in ["", "bad", &"g".repeat(64), &"a".repeat(63)] {
+            assert!(approval_reference(malformed).is_err());
+        }
+    }
 }
 
 pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(), CliError> {
