@@ -6,6 +6,117 @@
 use super::*;
 use nostr::{EventBuilder, Keys, Kind, Tag};
 
+#[tokio::test]
+async fn workflow_attempts_command_signed_http_preserves_scope_and_errors() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use tauri::Manager;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _serial = crate::relay_admission::TEST_SERIAL.lock().await;
+    crate::relay_admission::reset_rate_limit_gate();
+    for case in ["valid", "foreign", "unauthorized", "malformed"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let keys = Keys::generate();
+        let state = crate::app_state::build_app_state();
+        *state.relay_url_override.lock().unwrap() = Some(format!("ws://{addr}"));
+        *state.keys.lock().unwrap() = keys.clone();
+        let app = tauri::test::mock_builder()
+            .manage(state)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let request = || WorkflowAttemptsRequest {
+            workflow_id: WF.into(),
+            run_id: CHAN.into(),
+            after_index: Some(15),
+            expected_relay_url: format!("ws://{addr}"),
+            expected_signer_pubkey: keys.public_key().to_hex(),
+        };
+        // Guards must reject before a connection, not merely after receiving JSON.
+        let mut wrong = request();
+        wrong.expected_signer_pubkey = Keys::generate().public_key().to_hex();
+        assert!(get_run_attempts(wrong, app.state()).await.is_err());
+        let mut wrong = request();
+        wrong.expected_relay_url = "ws://127.0.0.1:1".into();
+        assert!(get_run_attempts(wrong, app.state()).await.is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                assert!(bytes.len() < 16384);
+            }
+            let headers = String::from_utf8(bytes).unwrap();
+            let path = format!("/workflows/{WF}/runs/{CHAN}/attempts?limit=16&after_index=15");
+            assert!(headers.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+            let auth = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then_some(value.trim())
+                })
+                .unwrap();
+            let event: nostr::Event = serde_json::from_slice(
+                &STANDARD
+                    .decode(auth.strip_prefix("Nostr ").unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            event.verify().unwrap();
+            assert_eq!(event.pubkey, keys.public_key());
+            assert_eq!(event.kind, Kind::Custom(27235));
+            let tags = serde_json::to_value(&event.tags).unwrap();
+            assert!(tags
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(["u", format!("http://{addr}{path}")])));
+            assert!(tags
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(["method", "GET"])));
+            // Switch the active identity/relay while the original read is pending.
+            let state: State<'_, AppState> = app.state();
+            *state.keys.lock().unwrap() = Keys::generate();
+            *state.relay_url_override.lock().unwrap() = Some("ws://127.0.0.1:1".into());
+            let body = match case {
+                "malformed" => "not json".to_string(),
+                "unauthorized" => r#"{"error":"unauthorized"}"#.into(),
+                _ => serde_json::json!({"workflow_id": WF, "run_id": if case == "foreign" { WF } else { CHAN }, "attempts": [], "next": null}).to_string(),
+            };
+            let status = if case == "unauthorized" {
+                "401 Unauthorized"
+            } else {
+                "200 OK"
+            };
+            stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(get_run_attempts(request(), app.state()), server)
+        })
+        .await
+        .unwrap();
+        if case == "valid" {
+            assert_eq!(
+                result.unwrap(),
+                serde_json::json!({"workflow_id":WF,"run_id":CHAN,"attempts":[],"next":null})
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "{case} must not become successful empty history"
+            );
+        }
+    }
+}
+
 /// Build a signed kind:30620 workflow definition event with the given YAML
 /// content and d/h tags.
 fn wf_event(d: &str, h: &str, yaml: &str) -> nostr::Event {

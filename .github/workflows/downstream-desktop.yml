@@ -38,4 +38,4 @@ jobs:
           persist-credentials: false
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib --locked --no-default-features approval_decision
-      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib --locked --no-default-features workflow_attempts_request_is_bounded
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib --locked --no-default-features workflow_attempts_

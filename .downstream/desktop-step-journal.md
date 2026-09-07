@@ -17,4 +17,12 @@ verified 16+1 paging, expanded digest, unconfirmed return, read failure, foreign
 scope rejection, empty legacy explanation and recovery by refresh. This is not
 a native GUI or deployed-user rehearsal. Signed relay/CLI crash-wire evidence
 121/121 belongs to backend revision c8473bb9, not proof of this new native read
-command's real HTTP transport. That transport probe remains required.
+command's real relay integration.
+
+The native `workflow_attempts_command_signed_http_preserves_scope_and_errors`
+test now invokes the actual Tauri command against an ephemeral loopback HTTP
+peer: verifies the Schnorr event, signer, kind 27235, GET and exact URL including
+cursor; proves wrong relay/signer are rejected before connection; switches the
+active relay/signer before returning the response; and checks foreign scope,
+401 and malformed JSON remain errors. This is real native HTTP transport with
+synthetic peer responses, not a live relay/database or native GUI rehearsal.
