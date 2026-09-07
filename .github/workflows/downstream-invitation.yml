@@ -68,6 +68,12 @@ jobs:
       - run: cargo test -p buzz-db workflow_run_creation_joins_caller_transaction --lib --locked -- --ignored
       - run: cargo test -p buzz-db pending_start_inventory_is_bounded_and_excludes_progress --lib --locked -- --ignored
       - run: cargo test -p buzz-db scheduled_run_transaction_rolls_back_and_deduplicates --lib --locked -- --ignored
+      - run: cargo test -p buzz-db workflow_execution_fences_expiry_and_stale_completion --lib --locked -- --ignored
+      - run: cargo test -p buzz-db workflow_execution_resume_rotates_ownership --lib --locked -- --ignored
+      - name: Verify execution ownership after embedded migrations in a separate empty database
+        run: |
+          psql "$BUZZ_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE workflow_ownership_migration'
+          BUZZ_TEST_DATABASE_URL=postgres://preflight:isolated-test-only@127.0.0.1:5432/workflow_ownership_migration BUZZ_TEST_SCHEMA_MODE=migration cargo test -p buzz-db migration_schema_workflow_execution_fences --lib --locked -- --ignored
       - run: cargo test -p buzz-relay pending_recovery_uses_original_inputs_and_current_authority --lib --locked --no-default-features -- --ignored
       - run: cargo test -p buzz-workflow on_event_denies_run_after_owner_removed --lib --locked --no-default-features -- --ignored
       - run: cargo test -p buzz-db approval_decision_joins_transaction_and_checks_write_time_expiry --lib --locked -- --ignored

@@ -393,6 +393,10 @@ CREATE TABLE workflow_runs (
     current_step        INT NOT NULL DEFAULT 0,
     execution_trace     JSONB NOT NULL DEFAULT '[]',
     trigger_context     JSONB,
+    execution_token     UUID,
+    execution_epoch     BIGINT NOT NULL DEFAULT 0 CHECK (execution_epoch >= 0),
+    execution_lease_until TIMESTAMPTZ,
+    execution_uncertain BOOLEAN NOT NULL DEFAULT FALSE,
     started_at          TIMESTAMPTZ,
     completed_at        TIMESTAMPTZ,
     error_message       TEXT,
@@ -405,6 +409,8 @@ CREATE TABLE workflow_runs (
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+CREATE INDEX idx_workflow_runs_execution_lease ON workflow_runs (execution_lease_until)
+    WHERE status = 'running' AND execution_token IS NOT NULL;
 
 -- ── Workflow approvals ────────────────────────────────────────────────────────
 -- token-hash lookup scoped: approval token grants cannot act on another
@@ -1892,4 +1898,3 @@ CREATE INDEX idx_relay_operator_audit_target
 
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('relay_operator_audit', 'deployment-global append-only roster mutation audit trail; no community_id intentionally');
-

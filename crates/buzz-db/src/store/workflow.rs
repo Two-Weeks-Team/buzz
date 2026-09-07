@@ -989,6 +989,15 @@ pub async fn update_workflow_run(
     Ok(())
 }
 
+/// Opaque ownership of one execution interval, not business authority.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowExecutionClaim {
+    /// Caller-generated token, retained even if a claim response is lost.
+    pub token: Uuid,
+    /// Monotonically increasing per-run generation.
+    pub epoch: i64,
+}
+
 /// A never-claimed initial dispatch candidate; inventory does not authorize execution.
 #[derive(Debug)]
 pub struct PendingWorkflowStart {
@@ -1392,6 +1401,127 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Claim an initial dispatch or an exactly granted resume and record its
+    /// ownership in the same UPDATE. Never reclaim Running or uncertain effects.
+    /// `next_step=None` means initial; Some(n) requires a granted gate at n-1.
+    pub async fn claim_workflow_execution(
+        &self,
+        community: CommunityId,
+        run: Uuid,
+        token: Uuid,
+        next_step: Option<i32>,
+    ) -> Result<Option<WorkflowExecutionClaim>> {
+        let epoch: Option<i64> = sqlx::query_scalar(
+            "UPDATE workflow_runs r SET status='running',
+             current_step=COALESCE($4,0), started_at=COALESCE(started_at,NOW()),
+             execution_token=$3,execution_epoch=execution_epoch+1,
+             execution_lease_until=clock_timestamp()+interval '120 seconds'
+             WHERE community_id=$1 AND id=$2 AND NOT execution_uncertain
+               AND (($4::int IS NULL AND status='pending' AND current_step=0
+                     AND execution_trace='[]'::jsonb AND execution_token IS NULL)
+                 OR ($4>0 AND status='waiting_approval' AND current_step+1=$4
+                     AND EXISTS (SELECT 1 FROM workflow_approvals a
+                       WHERE a.community_id=r.community_id AND a.run_id=r.id
+                         AND a.workflow_id=r.workflow_id AND a.step_index=r.current_step
+                         AND a.status='granted')))
+             RETURNING execution_epoch",
+        )
+        .bind(community.as_uuid())
+        .bind(run)
+        .bind(token)
+        .bind(next_step)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(epoch.map(|epoch| WorkflowExecutionClaim { token, epoch }))
+    }
+
+    /// Renew only live ownership. An expired lease cannot be resurrected even
+    /// before the observer has classified its outcome as uncertain.
+    pub async fn renew_workflow_execution(
+        &self,
+        community: CommunityId,
+        run: Uuid,
+        claim: WorkflowExecutionClaim,
+    ) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE workflow_runs SET execution_lease_until=clock_timestamp()+interval '120 seconds'
+             WHERE community_id=$1 AND id=$2 AND status='running'
+               AND execution_token=$3 AND execution_epoch=$4 AND NOT execution_uncertain
+               AND execution_lease_until>clock_timestamp()",
+        ).bind(community.as_uuid()).bind(run).bind(claim.token).bind(claim.epoch)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(changed == 1)
+    }
+
+    /// Fence one expired execution as uncertain without resetting its run or
+    /// asserting whether an external effect happened. Preserve all evidence.
+    pub async fn mark_workflow_execution_uncertain(
+        &self,
+        community: CommunityId,
+        run: Uuid,
+        claim: WorkflowExecutionClaim,
+    ) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE workflow_runs SET execution_uncertain=true
+             WHERE community_id=$1 AND id=$2 AND status='running'
+               AND execution_token=$3 AND execution_epoch=$4 AND NOT execution_uncertain
+               AND execution_lease_until<=clock_timestamp()",
+        )
+        .bind(community.as_uuid())
+        .bind(run)
+        .bind(claim.token)
+        .bind(claim.epoch)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(changed == 1)
+    }
+
+    /// Persist a terminal result only while the exact claim is still live.
+    /// Approval suspension needs its own atomic gate+trace transaction instead.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_workflow_execution(
+        &self,
+        community: CommunityId,
+        run: Uuid,
+        claim: WorkflowExecutionClaim,
+        status: RunStatus,
+        step: i32,
+        trace: &serde_json::Value,
+        failure: Option<WorkflowRunFailure<'_>>,
+    ) -> Result<bool> {
+        if !matches!(
+            status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) || step < 0
+        {
+            return Err(DbError::InvalidData(
+                "invalid owned execution terminal state".into(),
+            ));
+        }
+        let changed = sqlx::query(
+            "UPDATE workflow_runs SET status=$5::run_status,current_step=$6,
+             execution_trace=$7,error_code=$8,error_message=$9,completed_at=NOW(),
+             execution_lease_until=NULL
+             WHERE community_id=$1 AND id=$2 AND status='running'
+               AND execution_token=$3 AND execution_epoch=$4 AND NOT execution_uncertain
+               AND execution_lease_until>clock_timestamp()",
+        )
+        .bind(community.as_uuid())
+        .bind(run)
+        .bind(claim.token)
+        .bind(claim.epoch)
+        .bind(status.to_string())
+        .bind(step)
+        .bind(trace)
+        .bind(failure.as_ref().map(|f| f.code))
+        .bind(failure.as_ref().map(|f| f.message))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(changed == 1)
+    }
+
     /// Commit the schedule claim, original inputs, Pending run and audit link
     /// together. A failed insert/link leaves the instant available for retry.
     /// Only the winning transaction returns a run; losers create no run.
@@ -3935,6 +4065,250 @@ mod postgres_tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn workflow_execution_fences_expiry_and_stale_completion() {
+        assert_execution_fences().await;
+    }
+
+    async fn assert_execution_fences() {
+        let pool = PgPool::connect(&crate::test_support::database_url())
+            .await
+            .unwrap();
+        let community = make_community(&pool).await;
+        let workflow = Uuid::new_v4();
+        insert_workflow_with_ids(
+            &pool,
+            community,
+            workflow,
+            Uuid::new_v4(),
+            "execution-fence",
+        )
+        .await;
+        let db = Db::from_pool(pool.clone());
+        let original = serde_json::json!({"marker":"original evidence"});
+        let run = create_workflow_run(&pool, community, workflow, None, Some(&original))
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            db.claim_workflow_execution(community, run, Uuid::new_v4(), None),
+            db.claim_workflow_execution(community, run, Uuid::new_v4(), None)
+        );
+        let claims: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
+        assert_eq!(claims.len(), 1);
+        let claim = claims[0];
+        assert_eq!(claim.epoch, 1);
+        assert!(db
+            .renew_workflow_execution(community, run, claim)
+            .await
+            .unwrap());
+        assert!(!db
+            .mark_workflow_execution_uncertain(community, run, claim)
+            .await
+            .unwrap());
+        let foreign = make_community(&pool).await;
+        for (scope, bad) in [
+            (foreign, claim),
+            (
+                community,
+                WorkflowExecutionClaim {
+                    token: Uuid::new_v4(),
+                    ..claim
+                },
+            ),
+            (community, WorkflowExecutionClaim { epoch: 2, ..claim }),
+        ] {
+            assert!(!db.renew_workflow_execution(scope, run, bad).await.unwrap());
+            assert!(!db
+                .finish_workflow_execution(
+                    scope,
+                    run,
+                    bad,
+                    RunStatus::Completed,
+                    1,
+                    &serde_json::json!([]),
+                    None
+                )
+                .await
+                .unwrap());
+        }
+        sqlx::query("UPDATE workflow_runs SET execution_lease_until=clock_timestamp()-interval '1 second' WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid()).bind(run).execute(&pool).await.unwrap();
+        assert!(!db
+            .renew_workflow_execution(community, run, claim)
+            .await
+            .unwrap());
+        assert!(!db
+            .finish_workflow_execution(
+                community,
+                run,
+                claim,
+                RunStatus::Completed,
+                1,
+                &serde_json::json!([]),
+                None
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .mark_workflow_execution_uncertain(community, run, claim)
+            .await
+            .unwrap());
+        assert!(!db
+            .mark_workflow_execution_uncertain(community, run, claim)
+            .await
+            .unwrap());
+        assert!(db
+            .claim_workflow_execution(community, run, Uuid::new_v4(), None)
+            .await
+            .unwrap()
+            .is_none());
+        let stored = db.get_workflow_run(community, run).await.unwrap();
+        assert_eq!(stored.status, RunStatus::Running);
+        assert_eq!(stored.trigger_context, Some(original));
+        let uncertain: bool = sqlx::query_scalar(
+            "SELECT execution_uncertain FROM workflow_runs WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(uncertain);
+        let terminal = create_workflow_run(&pool, community, workflow, None, None)
+            .await
+            .unwrap();
+        let owner = db
+            .claim_workflow_execution(community, terminal, Uuid::new_v4(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .finish_workflow_execution(
+                community,
+                terminal,
+                owner,
+                RunStatus::Completed,
+                1,
+                &serde_json::json!([{ "step_id":"done" }]),
+                None
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .finish_workflow_execution(
+                community,
+                terminal,
+                owner,
+                RunStatus::Failed,
+                0,
+                &serde_json::json!([]),
+                None
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .renew_workflow_execution(community, terminal, owner)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_workflow_run(community, terminal)
+                .await
+                .unwrap()
+                .status,
+            RunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn workflow_execution_resume_rotates_ownership() {
+        let pool = PgPool::connect(&crate::test_support::database_url())
+            .await
+            .unwrap();
+        let community = make_community(&pool).await;
+        let workflow = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community, workflow, Uuid::new_v4(), "resume-owner").await;
+        let db = Db::from_pool(pool.clone());
+        let run = create_workflow_run(&pool, community, workflow, None, None)
+            .await
+            .unwrap();
+        let first = db
+            .claim_workflow_execution(community, run, Uuid::new_v4(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        // Stored gate fixture; the signed decision path is tested separately.
+        update_workflow_run(
+            &pool,
+            community,
+            run,
+            RunStatus::WaitingApproval,
+            0,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .claim_workflow_execution(community, run, Uuid::new_v4(), Some(1))
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("INSERT INTO workflow_approvals (community_id,token,workflow_id,run_id,step_id,step_index,approver_spec,status,expires_at) VALUES ($1,$2,$3,$4,'gate',0,'any','granted',NOW()+interval '1 hour')")
+            .bind(community.as_uuid()).bind(hash_approval_token("resume-fixture")).bind(workflow).bind(run).execute(&pool).await.unwrap();
+        assert!(db
+            .claim_workflow_execution(community, run, Uuid::new_v4(), Some(2))
+            .await
+            .unwrap()
+            .is_none());
+        let second = db
+            .claim_workflow_execution(community, run, Uuid::new_v4(), Some(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.epoch, first.epoch + 1);
+        assert_ne!(second.token, first.token);
+        assert!(!db
+            .renew_workflow_execution(community, run, first)
+            .await
+            .unwrap());
+        assert!(!db
+            .finish_workflow_execution(
+                community,
+                run,
+                first,
+                RunStatus::Failed,
+                0,
+                &serde_json::json!([]),
+                None
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .finish_workflow_execution(
+                community,
+                run,
+                second,
+                RunStatus::Completed,
+                1,
+                &serde_json::json!([]),
+                None
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn migration_schema_workflow_execution_fences() {
+        let pool = PgPool::connect(&crate::test_support::database_url())
+            .await
+            .unwrap();
+        Db::from_pool(pool).migrate().await.unwrap();
+        assert_execution_fences().await;
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------
