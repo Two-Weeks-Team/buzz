@@ -8,6 +8,14 @@
   "automatic_publish": false,
   "patches": [
     {
+      "id": "workflow-journal-runtime",
+      "summary": "Require committed step intent before dispatch and a fenced returned result before advancing",
+      "paths": ["crates/buzz-workflow/src/executor.rs", "crates/buzz-workflow/src/error.rs", "crates/buzz-workflow/src/lib.rs", "crates/buzz-workflow/src/schema.rs", "crates/buzz-relay/src/handlers/command_executor.rs"],
+      "tests": ["cargo test -p buzz-workflow --lib --locked --no-default-features", "cargo test -p buzz-relay native_executor_ --lib --locked --no-default-features -- --ignored"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/crates/buzz-workflow/src/executor.rs",
+      "status": "candidate"
+    },
+    {
       "id": "workflow-step-attempt-journal",
       "summary": "Add bounded durable step intent and returned-result primitives fenced by live execution ownership",
       "paths": ["migrations/0046_workflow_step_attempts.sql", "schema/schema.sql", "crates/buzz-db/src/store/workflow_steps.rs", "crates/buzz-db/src/store/workflow_steps_postgres_tests.rs", "crates/buzz-db/src/store/deletion.rs", "scripts/reconcile-schema-after-pgschema.sql"],

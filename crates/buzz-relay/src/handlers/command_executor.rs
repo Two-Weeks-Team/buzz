@@ -1560,7 +1560,7 @@ mod postgres_tests {
             .unwrap();
         assert!(matches!(
             &result,
-            Err((buzz_workflow::WorkflowError::ExecutionOwnershipLost, _))
+            Err((buzz_workflow::WorkflowError::ExecutionJournalUnconfirmed, _))
         ));
         engine.finalize_run(community, run, result, None).await;
         let uncertain: bool = sqlx::query_scalar(
@@ -1572,6 +1572,10 @@ mod postgres_tests {
         .await
         .unwrap();
         assert!(uncertain);
+        let attempts: Vec<(i32, String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT step_index,step_id,result FROM workflow_step_attempts WHERE community_id=$1 AND run_id=$2 ORDER BY step_index",
+        ).bind(community.as_uuid()).bind(run).fetch_all(&pool).await.unwrap();
+        assert_eq!(attempts, vec![(0, "pause".into(), None)]);
         assert!(db
             .get_run_approvals(community, workflow, run)
             .await
@@ -1583,6 +1587,162 @@ mod postgres_tests {
             preserved.trigger_context,
             Some(serde_json::json!({"original":"preserve"}))
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn native_executor_journals_steps_and_denies_ambiguous_dispatch() {
+        let (db, tenant) = persistence_test_context().await;
+        let community = tenant.community();
+        let owner = Keys::generate().public_key().to_bytes();
+        db.ensure_user(community, &owner).await.unwrap();
+        let (definition,json)=buzz_workflow::WorkflowEngine::parse_yaml(
+            "name: journal\ntrigger:\n  on: message_posted\nsteps:\n  - id: skip\n    if: 'false'\n    action: delay\n    duration: 30s\n  - id: pause\n    action: delay\n    duration: 1s\n  - id: gate\n    action: request_approval\n    from: any\n    message: synthetic review\n  - id: after_gate\n    action: delay\n    duration: 1s\n").unwrap();
+        let workflow = db
+            .create_workflow(community, None, &owner, "journal", &json, &[9; 32])
+            .await
+            .unwrap();
+        let run = db
+            .create_workflow_run(community, workflow, None, None)
+            .await
+            .unwrap();
+        let engine = buzz_workflow::WorkflowEngine::new(db.clone(), Default::default());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            buzz_workflow::executor::execute_run(
+                &engine,
+                community,
+                run,
+                &definition,
+                &Default::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        engine.finalize_run(community, run, Ok(result), None).await;
+        assert_eq!(
+            db.get_workflow_run(community, run).await.unwrap().status,
+            RunStatus::WaitingApproval
+        );
+        let pool = sqlx::PgPool::connect(&std::env::var("BUZZ_TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let attempts:Vec<(i32,String,serde_json::Value)>=sqlx::query_as("SELECT step_index,step_id,result FROM workflow_step_attempts WHERE community_id=$1 AND run_id=$2 ORDER BY step_index")
+            .bind(community.as_uuid()).bind(run).fetch_all(&pool).await.unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(
+            attempts[0],
+            (0, "skip".into(), serde_json::json!({"status":"skipped"}))
+        );
+        assert_eq!(attempts[1].2["status"], "completed");
+        assert_eq!(
+            attempts[2],
+            (
+                2,
+                "gate".into(),
+                serde_json::json!({"status":"suspension_requested"})
+            )
+        );
+        assert_eq!(
+            db.get_run_approvals(community, workflow, run)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Exercise resumed ownership using the DB approval primitive. Signed
+        // authority/transport is a separate wire test, not proved by this fixture.
+        let gate = db
+            .get_run_approvals(community, workflow, run)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(db
+            .update_approval_by_stored_hash(
+                community,
+                &gate.token,
+                ApprovalStatus::Granted,
+                Some(&owner),
+                None
+            )
+            .await
+            .unwrap());
+        let prior = db
+            .get_workflow_run(community, run)
+            .await
+            .unwrap()
+            .execution_trace
+            .as_array()
+            .cloned();
+        let resumed = buzz_workflow::executor::execute_from_step(
+            &engine,
+            community,
+            run,
+            &definition,
+            &Default::default(),
+            3,
+            None,
+        )
+        .await;
+        assert!(resumed.is_ok());
+        engine.finalize_run(community, run, resumed, prior).await;
+        assert_eq!(
+            db.get_workflow_run(community, run).await.unwrap().status,
+            RunStatus::Completed
+        );
+        let generations:Vec<(i32,i64)>=sqlx::query_as("SELECT step_index,execution_epoch FROM workflow_step_attempts WHERE community_id=$1 AND run_id=$2 ORDER BY step_index")
+            .bind(community.as_uuid()).bind(run).fetch_all(&pool).await.unwrap();
+        assert_eq!(generations, vec![(0, 1), (1, 1), (2, 1), (3, 2)]);
+
+        // An unexplained existing intent is not permission to run it again.
+        // If begin's dispatch guard is removed, the 30s delay trips this 2s bound.
+        let (blocked_def,blocked_json)=buzz_workflow::WorkflowEngine::parse_yaml(
+            "name: ambiguous\ntrigger:\n  on: message_posted\nsteps:\n  - id: pause\n    action: delay\n    duration: 30s\n").unwrap();
+        let blocked_workflow = db
+            .create_workflow(
+                community,
+                None,
+                &owner,
+                "ambiguous",
+                &blocked_json,
+                &[8; 32],
+            )
+            .await
+            .unwrap();
+        let blocked = db
+            .create_workflow_run(community, blocked_workflow, None, None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflow_step_attempts(community_id,run_id,step_index,execution_epoch,step_id,action_digest) VALUES($1,$2,0,1,'pause',$3)")
+            .bind(community.as_uuid()).bind(blocked).bind(&[0u8;32][..]).execute(&pool).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            buzz_workflow::executor::execute_run(
+                &engine,
+                community,
+                blocked,
+                &blocked_def,
+                &Default::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &result,
+            Err((buzz_workflow::WorkflowError::ExecutionJournalUnconfirmed, _))
+        ));
+        engine.finalize_run(community, blocked, result, None).await;
+        let uncertain: bool = sqlx::query_scalar(
+            "SELECT execution_uncertain FROM workflow_runs WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(blocked)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(uncertain);
     }
 
     fn rejection_message(result: Result<Option<Vec<u8>>, IngestError>) -> String {

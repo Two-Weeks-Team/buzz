@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use buzz_core::tenant::CommunityId;
 use evalexpr::HashMapContext;
+use nostr::hashes::{sha256, Hash};
 use nostr::ToBech32;
 use serde_json::Value as JsonValue;
 use tracing::{debug, info, warn};
@@ -1277,6 +1278,30 @@ async fn execute_steps(
                 }
                 Ok(false) => {
                     info!(run_id = %run_id, step = %step.id, "Condition false — skipping step");
+                    let journal = StepJournal {
+                        engine,
+                        community: community_id,
+                        run: run_id,
+                        claim,
+                        index: i,
+                        step_id: &step.id,
+                    };
+                    if !journal
+                        .begin(&serde_json::json!({"condition_false": expr}))
+                        .await
+                        || !journal
+                            .record(&serde_json::json!({"status":"skipped"}), true)
+                            .await
+                    {
+                        return Err((
+                            WorkflowError::ExecutionJournalUnconfirmed,
+                            crate::error::PartialProgress {
+                                step_index: i,
+                                trace,
+                                claim: Some(claim),
+                            },
+                        ));
+                    }
                     trace.push(serde_json::json!({
                         "step_id": step.id,
                         "status": "skipped",
@@ -1327,6 +1352,24 @@ async fn execute_steps(
                 },
             ));
         }
+        let journal = StepJournal {
+            engine,
+            community: community_id,
+            run: run_id,
+            claim,
+            index: i,
+            step_id: &step.id,
+        };
+        if !journal.begin(&resolved_action).await {
+            return Err((
+                WorkflowError::ExecutionJournalUnconfirmed,
+                crate::error::PartialProgress {
+                    step_index: i,
+                    trace,
+                    claim: Some(claim),
+                },
+            ));
+        }
         let dispatch_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             dispatch_action(
@@ -1366,6 +1409,28 @@ async fn execute_steps(
             }
         };
 
+        let (returned, advance) = match &result {
+            StepResult::Completed(output) => (
+                serde_json::json!({"status":"completed","output":output}),
+                true,
+            ),
+            StepResult::Skipped => (serde_json::json!({"status":"skipped"}), true),
+            // Never persist the approval token in the journal. Gate persistence
+            // remains the finalizer's atomic gate/snapshot transaction.
+            StepResult::Suspended { .. } => {
+                (serde_json::json!({"status":"suspension_requested"}), false)
+            }
+        };
+        if !journal.record(&returned, advance).await {
+            return Err((
+                WorkflowError::ExecutionJournalUnconfirmed,
+                crate::error::PartialProgress {
+                    step_index: i,
+                    trace,
+                    claim: Some(claim),
+                },
+            ));
+        }
         match result {
             StepResult::Completed(output) => {
                 debug!(run_id = %run_id, step = %step.id, "Step completed");
@@ -1422,6 +1487,61 @@ async fn execute_steps(
         step_outputs,
         trace,
     })
+}
+
+struct StepJournal<'a> {
+    engine: &'a WorkflowEngine,
+    community: CommunityId,
+    run: Uuid,
+    claim: buzz_db::workflow::WorkflowExecutionClaim,
+    index: usize,
+    step_id: &'a str,
+}
+
+impl StepJournal<'_> {
+    async fn begin(&self, action: &impl serde::Serialize) -> bool {
+        let Ok(bytes) = serde_json::to_vec(action) else {
+            return false;
+        };
+        let digest = sha256::Hash::hash(&bytes).to_byte_array();
+        let Ok(index) = i32::try_from(self.index) else {
+            return false;
+        };
+        matches!(
+            self.engine
+                .db
+                .begin_workflow_step_attempt(
+                    self.community,
+                    self.run,
+                    self.claim,
+                    index,
+                    self.step_id,
+                    &digest
+                )
+                .await,
+            Ok(true)
+        )
+    }
+
+    async fn record(&self, returned: &JsonValue, advance: bool) -> bool {
+        let Ok(index) = i32::try_from(self.index) else {
+            return false;
+        };
+        matches!(
+            self.engine
+                .db
+                .record_workflow_step_return(
+                    self.community,
+                    self.run,
+                    self.claim,
+                    index,
+                    returned,
+                    advance
+                )
+                .await,
+            Ok(true)
+        )
+    }
 }
 
 fn approval_snapshot(

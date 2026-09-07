@@ -177,6 +177,11 @@ impl WorkflowDef {
             ));
         }
 
+        if self.steps.len() > 4096 {
+            return Err(WorkflowError::InvalidDefinition(
+                "at most 4096 steps are supported".into(),
+            ));
+        }
         if self.steps.is_empty() {
             return Err(WorkflowError::InvalidDefinition(
                 "at least one step is required".into(),
@@ -318,6 +323,25 @@ pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn validate_bounds_steps_to_durable_journal_capacity() {
+        let (mut def, _) = parse_yaml("name: bounded\ntrigger:\n  on: webhook\nsteps:\n  - id: s\n    action: delay\n    duration: 1s\n").unwrap();
+        let template = def.steps[0].clone();
+        def.steps = (0..4096)
+            .map(|index| {
+                let mut step = template.clone();
+                step.id = format!("s{index}");
+                step
+            })
+            .collect();
+        assert!(def.validate().is_ok());
+        let mut extra = template;
+        extra.id = "overflow".into();
+        def.steps.push(extra);
+        assert!(
+            matches!(def.validate(), Err(WorkflowError::InvalidDefinition(message)) if message.contains("4096"))
+        );
+    }
     use super::*;
 
     #[test]

@@ -60,6 +60,9 @@ pub enum WorkflowError {
     /// Execution ownership could not be renewed; outcome may be uncertain.
     #[error("execution ownership lost")]
     ExecutionOwnershipLost,
+    /// A durable step intent or return could not be confirmed; never replay.
+    #[error("execution journal write unconfirmed")]
+    ExecutionJournalUnconfirmed,
 
     /// A database operation failed.
     #[error("database error: {0}")]
@@ -90,6 +93,7 @@ impl WorkflowError {
             Self::ResumeNotClaimed(_) => "resume_not_claimed",
             Self::StartNotClaimed(_) => "start_not_claimed",
             Self::ExecutionOwnershipLost => "execution_ownership_lost",
+            Self::ExecutionJournalUnconfirmed => "execution_journal_unconfirmed",
             Self::Database(_) => "database_error",
             Self::Unauthorized(_) => "owner_unauthorized",
             Self::NotImplemented(_) => "action_not_implemented",

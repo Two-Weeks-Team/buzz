@@ -89,3 +89,4 @@ jobs:
       - run: cargo test -p buzz-db approval_expiry_preserves_decisions_and_exact_waiting_gate --lib --locked -- --ignored
       - run: cargo test -p buzz-relay native_executor_finalizer_persists_queryable_approval_gate --lib --locked --no-default-features -- --ignored
       - run: cargo test -p buzz-relay native_executor_stops_after_execution_lease_loss --lib --locked --no-default-features -- --ignored
+      - run: cargo test -p buzz-relay native_executor_journals_steps_and_denies_ambiguous_dispatch --lib --locked --no-default-features -- --ignored

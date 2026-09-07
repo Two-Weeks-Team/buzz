@@ -231,6 +231,7 @@ impl WorkflowEngine {
             &result,
             Err((
                 WorkflowError::ExecutionOwnershipLost
+                    | WorkflowError::ExecutionJournalUnconfirmed
                     | WorkflowError::StepTimeout { .. }
                     | WorkflowError::WebhookError(_),
                 _
