@@ -34,6 +34,8 @@ type RawTraceEntry = {
   started_at?: number | null;
   completed_at?: number | null;
   error?: string | null;
+  message?: string | null;
+  approval_ref?: string | null;
 };
 
 type RawWorkflowRun = {
@@ -121,6 +123,8 @@ function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
     startedAt: raw.started_at ?? null,
     completedAt: raw.completed_at ?? null,
     error: raw.error ?? null,
+    message: raw.message ?? null,
+    approvalRef: raw.approval_ref ?? null,
   };
 }
 

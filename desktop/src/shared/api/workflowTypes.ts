@@ -32,6 +32,8 @@ export type TraceEntry = {
   startedAt: number | null;
   completedAt: number | null;
   error: string | null;
+  message?: string | null;
+  approvalRef?: string | null;
 };
 
 export type WorkflowRun = {
