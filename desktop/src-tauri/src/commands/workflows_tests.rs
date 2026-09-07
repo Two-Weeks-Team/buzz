@@ -471,3 +471,19 @@ fn run_reads_serialize_to_backend_envelopes() {
         serde_json::json!({ "approvals": [] })
     );
 }
+#[test]
+fn workflow_attempts_request_is_bounded() {
+    let mut request = super::WorkflowAttemptsRequest {
+        workflow_id: "22222222-2222-4222-8222-222222222222".into(),
+        run_id: "11111111-1111-4111-8111-111111111111".into(),
+        after_index: Some(15),
+        expected_relay_url: "ws://localhost:63203".into(),
+        expected_signer_pubkey: "ab".repeat(32),
+    };
+    assert_eq!(super::workflow_attempts_path(&request).unwrap().0,"/workflows/22222222-2222-4222-8222-222222222222/runs/11111111-1111-4111-8111-111111111111/attempts?limit=16&after_index=15");
+    request.after_index = Some(4096);
+    assert!(super::workflow_attempts_path(&request).is_err());
+    request.after_index = None;
+    request.run_id = "../other".into();
+    assert!(super::workflow_attempts_path(&request).is_err());
+}

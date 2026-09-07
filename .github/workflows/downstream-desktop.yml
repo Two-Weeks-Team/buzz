@@ -21,7 +21,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
         working-directory: desktop
-      - run: node --import ./test-loader.mjs --experimental-strip-types --test src/features/workflows/ui/approvalTrace.test.mjs src/features/workflows/ui/approvalAction.test.mjs src/features/workflows/ui/workflowExecution.test.mjs src/features/workflows/ui/useWorkflowHistoryCapability.test.mjs src/shared/api/workflowApprovalDecision.test.mjs
+      - run: node --import ./test-loader.mjs --experimental-strip-types --test src/features/workflows/ui/approvalTrace.test.mjs src/features/workflows/ui/approvalAction.test.mjs src/features/workflows/ui/workflowExecution.test.mjs src/features/workflows/ui/useWorkflowHistoryCapability.test.mjs src/shared/api/workflowApprovalDecision.test.mjs src/shared/api/workflowAttempts.test.mjs
         working-directory: desktop
   native-approval:
     if: github.repository == 'Two-Weeks-Team/buzz'
@@ -38,3 +38,4 @@ jobs:
           persist-credentials: false
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib --locked --no-default-features approval_decision
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib --locked --no-default-features workflow_attempts_request_is_bounded

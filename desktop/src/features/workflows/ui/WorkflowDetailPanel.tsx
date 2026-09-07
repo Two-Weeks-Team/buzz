@@ -10,6 +10,7 @@ import {
 } from "@/features/workflows/hooks";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
 import { WorkflowExecutionNotice } from "./WorkflowExecutionNotice";
+import { WorkflowStepJournal } from "./WorkflowStepJournal";
 import { executionPresentation } from "@/shared/api/workflowExecution";
 import type { Workflow } from "@/shared/api/types";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -346,6 +347,21 @@ export function WorkflowDetailPanel({
                                 void runsQuery.refetch();
                               }}
                             />
+                            {actorScope ? (
+                              <WorkflowStepJournal
+                                key={`${actorScope.relayUrl}:${actorScope.pubkey}:${workflowId}:${run.id}`}
+                                scope={{
+                                  workflowId,
+                                  runId: run.id,
+                                  expectedRelayUrl: actorScope.relayUrl,
+                                  expectedSignerPubkey: actorScope.pubkey,
+                                }}
+                              />
+                            ) : (
+                              <p>
+                                Journal unavailable without an active identity.
+                              </p>
+                            )}
                             <div className="mb-3 flex items-center gap-2 text-2xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
                               <span>Execution Trace</span>
                               {approvalsQuery.isFetching ? (

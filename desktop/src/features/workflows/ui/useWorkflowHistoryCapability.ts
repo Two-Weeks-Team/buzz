@@ -1,17 +1,21 @@
 import * as React from "react";
 import { getRelayHttpUrl } from "@/shared/api/tauri";
 
-export function supportsWorkflowHistory(document: unknown): boolean {
+export function supportsWorkflowHistory(
+  document: unknown,
+  extension = "buzz.workflow-history.v1",
+): boolean {
   if (!document || typeof document !== "object") return false;
   const extensions = (document as { supported_extensions?: unknown })
     .supported_extensions;
-  return (
-    Array.isArray(extensions) && extensions.includes("buzz.workflow-history.v1")
-  );
+  return Array.isArray(extensions) && extensions.includes(extension);
 }
 
 /** Mount-scoped capability probe; late replies cannot leak across dialog/community changes. */
-export function useWorkflowHistoryCapability(open: boolean): boolean {
+export function useWorkflowHistoryCapability(
+  open: boolean,
+  extension = "buzz.workflow-history.v1",
+): boolean {
   const [supported, setSupported] = React.useState(false);
   React.useEffect(() => {
     setSupported(false);
@@ -28,7 +32,7 @@ export function useWorkflowHistoryCapability(open: boolean): boolean {
         });
         const document: unknown = response.ok ? await response.json() : null;
         if (!controller.signal.aborted)
-          setSupported(supportsWorkflowHistory(document));
+          setSupported(supportsWorkflowHistory(document, extension));
       } catch {
         // Unsupported, malformed and unavailable relays do not advertise support.
       } finally {
@@ -39,6 +43,6 @@ export function useWorkflowHistoryCapability(open: boolean): boolean {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [open]);
+  }, [open, extension]);
   return supported;
 }

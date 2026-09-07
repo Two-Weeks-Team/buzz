@@ -2,6 +2,28 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { supportsWorkflowHistory } from "./useWorkflowHistoryCapability.ts";
 
+test("attempt journal requires its own advertised capability", () => {
+  const extension = "buzz.workflow-attempts.v1";
+  assert.equal(
+    supportsWorkflowHistory(
+      { supported_extensions: ["buzz.workflow-history.v1"] },
+      extension,
+    ),
+    false,
+  );
+  assert.equal(
+    supportsWorkflowHistory({ supported_extensions: [extension] }, extension),
+    true,
+  );
+  assert.equal(
+    supportsWorkflowHistory(
+      { supported_extensions: ["buzz.workflow-attempts.v2"] },
+      extension,
+    ),
+    false,
+  );
+});
+
 test("only the versioned advertised capability enables workflow history", () => {
   assert.equal(
     supportsWorkflowHistory({

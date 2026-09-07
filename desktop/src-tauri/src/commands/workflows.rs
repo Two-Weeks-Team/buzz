@@ -211,6 +211,59 @@ pub async fn get_workflow_runs(
     .await
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowAttemptsRequest {
+    workflow_id: String,
+    run_id: String,
+    after_index: Option<u32>,
+    expected_relay_url: String,
+    expected_signer_pubkey: String,
+}
+
+fn workflow_attempts_path(
+    request: &WorkflowAttemptsRequest,
+) -> Result<(String, uuid::Uuid, uuid::Uuid), String> {
+    let workflow =
+        uuid::Uuid::parse_str(&request.workflow_id).map_err(|_| "invalid workflow id")?;
+    let run = uuid::Uuid::parse_str(&request.run_id).map_err(|_| "invalid workflow run id")?;
+    if request.after_index.is_some_and(|index| index >= 4096) {
+        return Err("invalid journal cursor".into());
+    }
+    let mut path = format!("/workflows/{workflow}/runs/{run}/attempts?limit=16");
+    if let Some(index) = request.after_index {
+        path.push_str(&format!("&after_index={index}"));
+    }
+    Ok((path, workflow, run))
+}
+
+/// Read one journal page with a captured relay/signer; never retarget on switch.
+#[tauri::command]
+pub async fn get_run_attempts(
+    request: WorkflowAttemptsRequest,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let (path, workflow, run) = workflow_attempts_path(&request)?;
+    if request.expected_relay_url.trim().is_empty() || request.expected_signer_pubkey.is_empty() {
+        return Err("journal read requires relay and signer scope".into());
+    }
+    let relay_base = crate::relay::relay_api_base_url_with_override(&state);
+    let keys = state.signing_keys()?;
+    crate::relay::assert_expected_relay_scope(Some(&request.expected_relay_url), &relay_base)?;
+    crate::relay::assert_expected_signer(
+        Some(&request.expected_signer_pubkey),
+        &keys.public_key().to_hex(),
+    )?;
+    let response: Value =
+        crate::relay::get_relay_json_at_with_keys(&state, &path, &relay_base, &keys).await?;
+    if response["workflow_id"].as_str() != Some(workflow.to_string().as_str())
+        || response["run_id"].as_str() != Some(run.to_string().as_str())
+    {
+        return Err("journal response scope mismatch".into());
+    }
+    Ok(response)
+}
+
 // ── Writes ───────────────────────────────────────────────────────────────────
 
 #[tauri::command]

@@ -779,6 +779,7 @@ pub fn run() {
             delete_workflow,
             get_workflow_runs,
             get_run_approvals,
+            get_run_attempts,
             trigger_workflow,
             grant_approval,
             deny_approval,
