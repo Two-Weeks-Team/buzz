@@ -112,6 +112,14 @@
       "status": "candidate"
     },
     {
+      "id": "desktop-approval-confirmation",
+      "summary": "Connect scoped review/confirm decisions with exact gate eligibility, single submission and unconfirmed outcome handling",
+      "paths": ["desktop/src/features/workflows/ui/WorkflowApprovalCard.tsx", "desktop/src/features/workflows/ui/WorkflowRunTrace.tsx", "desktop/src/features/workflows/ui/WorkflowDetailPanel.tsx", "desktop/src/features/workflows/ui/approvalAction.ts", "desktop/src/features/workflows/ui/approvalAction.test.mjs"],
+      "tests": ["cd desktop && node --import ./test-loader.mjs --experimental-strip-types --test src/features/workflows/ui/approvalAction.test.mjs src/features/workflows/ui/approvalTrace.test.mjs", "cd desktop && pnpm exec tsc --noEmit"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/desktop/src/features/workflows/ui/WorkflowApprovalCard.tsx",
+      "status": "candidate"
+    },
+    {
       "id": "approval-snapshot-resume-claim",
       "summary": "Carry typed approval snapshots, reject legacy/default resume context, and claim granted runs once",
       "paths": ["crates/buzz-workflow/src/snapshot.rs", "crates/buzz-workflow/src/executor.rs", "crates/buzz-workflow/src/error.rs", "crates/buzz-workflow/src/lib.rs", "crates/buzz-db/src/store/workflow.rs", "crates/buzz-relay/src/handlers/command_executor.rs"],

@@ -4,10 +4,19 @@ import type { WorkflowApproval, WorkflowRun } from "@/shared/api/types";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
 import { WorkflowApprovalCard } from "@/features/workflows/ui/WorkflowApprovalCard";
 import { approvalForTrace, approvalTraceStatus } from "./approvalTrace";
+import {
+  canDecideApproval,
+  type ApprovalActorScope,
+  type SubmitApprovalDecision,
+} from "./approvalAction";
 
 type WorkflowRunTraceProps = {
   run: WorkflowRun;
   approvals?: WorkflowApproval[];
+  actorScope?: ApprovalActorScope;
+  onDecision?: SubmitApprovalDecision;
+  onRefresh?: () => void;
+  decisionBusy?: boolean;
 };
 
 function formatStatusLabel(status: string) {
@@ -64,6 +73,10 @@ function formatDuration(startedAt: number | null, completedAt: number | null) {
 export function WorkflowRunTrace({
   run,
   approvals = [],
+  actorScope,
+  onDecision,
+  onRefresh,
+  decisionBusy,
 }: WorkflowRunTraceProps) {
   if (run.executionTrace.length === 0) {
     return (
@@ -148,7 +161,24 @@ export function WorkflowRunTrace({
                 <p className="mb-2 text-2xs font-medium uppercase tracking-[0.16em] text-amber-600">
                   Pending approval
                 </p>
-                <WorkflowApprovalCard approval={pendingApproval} />
+                <WorkflowApprovalCard
+                  key={`${pendingApproval.approvalRef}:${actorScope?.relayUrl}:${actorScope?.pubkey}`}
+                  approval={pendingApproval}
+                  question={step.message}
+                  scope={actorScope}
+                  onDecision={
+                    canDecideApproval(
+                      run,
+                      pendingApproval,
+                      actorScope,
+                      Date.now(),
+                    )
+                      ? onDecision
+                      : undefined
+                  }
+                  onRefresh={onRefresh}
+                  busy={decisionBusy}
+                />
               </div>
             ) : null}
           </div>

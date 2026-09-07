@@ -3,12 +3,19 @@ import * as React from "react";
 
 import {
   useRunApprovalsQuery,
+  useApprovalMutation,
   useTriggerWorkflowMutation,
   useWorkflowQuery,
   useWorkflowRunsQuery,
 } from "@/features/workflows/hooks";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
 import type { Workflow } from "@/shared/api/types";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
+import {
+  canDecideApproval,
+  type SubmitApprovalDecision,
+} from "./approvalAction";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Skeleton } from "@/shared/ui/skeleton";
@@ -36,11 +43,46 @@ export function WorkflowDetailPanel({
   const workflowQuery = useWorkflowQuery(workflowId);
   const runsQuery = useWorkflowRunsQuery(workflowId);
   const triggerMutation = useTriggerWorkflowMutation(workflowId);
+  const decisionMutation = useApprovalMutation();
+  const { activeCommunity } = useCommunities();
+  const identity = useIdentityQuery();
+  const actorScope =
+    activeCommunity && identity.data?.pubkey
+      ? { relayUrl: activeCommunity.relayUrl, pubkey: identity.data.pubkey }
+      : undefined;
+  const decisionLock = React.useRef(false);
   const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
 
   const workflow = workflowQuery.data;
   const runs = runsQuery.data ?? [];
   const approvalsQuery = useRunApprovalsQuery(workflowId, selectedRunId);
+  const decide: SubmitApprovalDecision = async (approval, action, note) => {
+    const run = runs.find((candidate) => candidate.id === selectedRunId);
+    if (
+      decisionLock.current ||
+      !run ||
+      !actorScope ||
+      approval.workflowId !== workflowId ||
+      approvalsQuery.isError ||
+      !canDecideApproval(run, approval, actorScope, Date.now())
+    ) {
+      throw new Error("Approval scope changed. Refresh history.");
+    }
+    decisionLock.current = true;
+    try {
+      await decisionMutation.mutateAsync({
+        action,
+        note,
+        approvalRef: approval.approvalRef,
+        workflowId: approval.workflowId,
+        runId: approval.runId,
+        expectedRelayUrl: actorScope.relayUrl,
+        expectedSignerPubkey: actorScope.pubkey,
+      });
+    } finally {
+      decisionLock.current = false;
+    }
+  };
   const workflowDescription = workflow
     ? getWorkflowDescription(workflow.definition)
     : null;
@@ -304,6 +346,18 @@ export function WorkflowDetailPanel({
                             <WorkflowRunTrace
                               approvals={approvalsQuery.data}
                               run={run}
+                              actorScope={actorScope}
+                              onDecision={
+                                approvalsQuery.isError ||
+                                run.workflowId !== workflowId
+                                  ? undefined
+                                  : decide
+                              }
+                              decisionBusy={decisionMutation.isPending}
+                              onRefresh={() => {
+                                void approvalsQuery.refetch();
+                                void runsQuery.refetch();
+                              }}
                             />
                           </div>
                         ) : null}
