@@ -1033,6 +1033,8 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
 /// - Resume execution from the correct step after approval.
 #[derive(Debug)]
 pub struct ExecutionResult {
+    /// Exact ownership that must guard suspension or completion writes.
+    pub claim: Option<buzz_db::workflow::WorkflowExecutionClaim>,
     /// Typed definition, trigger and resolved gate when suspended.
     pub snapshot: Option<crate::snapshot::ExecutionSnapshot>,
     /// Set when execution suspended at a `RequestApproval` step.
@@ -1079,7 +1081,7 @@ pub async fn execute_run(
 
     let claimed = engine
         .db
-        .claim_workflow_start(community_id, run_id)
+        .claim_workflow_execution(community_id, run_id, Uuid::new_v4(), None)
         .await
         .map_err(|e| {
             (
@@ -1088,14 +1090,24 @@ pub async fn execute_run(
             )
         })?;
 
-    if !claimed {
+    let Some(claim) = claimed else {
         return Err((
             WorkflowError::StartNotClaimed(run_id.to_string()),
             crate::error::PartialProgress::default(),
         ));
-    }
+    };
 
-    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+    execute_owned_steps(
+        engine,
+        community_id,
+        run_id,
+        def,
+        trigger_ctx,
+        0,
+        None,
+        claim,
+    )
+    .await
 }
 
 /// Resume execution from a specific step index (used for approval resume).
@@ -1153,7 +1165,7 @@ pub async fn execute_from_step(
     })?;
     let claimed = engine
         .db
-        .claim_workflow_resume(community_id, run_id, next_step)
+        .claim_workflow_execution(community_id, run_id, Uuid::new_v4(), Some(next_step))
         .await
         .map_err(|e| {
             (
@@ -1162,14 +1174,14 @@ pub async fn execute_from_step(
             )
         })?;
 
-    if !claimed {
+    let Some(claim) = claimed else {
         return Err((
             WorkflowError::ResumeNotClaimed("resume gate not granted or already claimed".into()),
             crate::error::PartialProgress::default(),
         ));
-    }
+    };
 
-    execute_steps(
+    execute_owned_steps(
         engine,
         community_id,
         run_id,
@@ -1177,8 +1189,42 @@ pub async fn execute_from_step(
         trigger_ctx,
         start_index,
         initial_outputs,
+        claim,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_owned_steps(
+    engine: &WorkflowEngine,
+    community: CommunityId,
+    run: Uuid,
+    def: &WorkflowDef,
+    trigger: &TriggerContext,
+    start: usize,
+    outputs: Option<HashMap<String, JsonValue>>,
+    claim: buzz_db::workflow::WorkflowExecutionClaim,
+) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
+    let execution = execute_steps(engine, community, run, def, trigger, start, outputs, claim);
+    tokio::pin!(execution);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            mut result = &mut execution => {
+                match &mut result {
+                    Ok(result) => result.claim=Some(claim),
+                    Err((_,progress)) => progress.claim=Some(claim),
+                }
+                return result;
+            }
+            _ = heartbeat.tick() => {
+                if !matches!(engine.db.renew_workflow_execution(community,run,claim).await,Ok(true)) {
+                    return Err((WorkflowError::ExecutionOwnershipLost,crate::error::PartialProgress { claim:Some(claim), ..Default::default() }));
+                }
+            }
+        }
+    }
 }
 
 /// Internal: execute workflow steps starting from `start_index`, without
@@ -1187,6 +1233,7 @@ pub async fn execute_from_step(
 ///
 /// On error, returns `(WorkflowError, PartialProgress)` so callers can persist
 /// the trace of steps completed before the failure.
+#[allow(clippy::too_many_arguments)]
 async fn execute_steps(
     engine: &WorkflowEngine,
     community_id: CommunityId,
@@ -1195,6 +1242,7 @@ async fn execute_steps(
     trigger_ctx: &TriggerContext,
     start_index: usize,
     initial_outputs: Option<HashMap<String, JsonValue>>,
+    claim: buzz_db::workflow::WorkflowExecutionClaim,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
     let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
     let mut trace: Vec<JsonValue> = Vec::new();
@@ -1203,6 +1251,23 @@ async fn execute_steps(
         if i < start_index {
             debug!(run_id = %run_id, step = %step.id, "Skipping already-executed step");
             continue;
+        }
+
+        if !matches!(
+            engine
+                .db
+                .renew_workflow_execution(community_id, run_id, claim)
+                .await,
+            Ok(true)
+        ) {
+            return Err((
+                WorkflowError::ExecutionOwnershipLost,
+                crate::error::PartialProgress {
+                    step_index: i,
+                    trace,
+                    claim: Some(claim),
+                },
+            ));
         }
 
         if let Some(expr) = &step.if_expr {
@@ -1221,6 +1286,7 @@ async fn execute_steps(
                 Err(e) => {
                     warn!(run_id = %run_id, step = %step.id, "Condition error: {e}");
                     let progress = crate::error::PartialProgress {
+                        claim: Some(claim),
                         step_index: i,
                         trace,
                     };
@@ -1233,6 +1299,7 @@ async fn execute_steps(
             Ok(a) => a,
             Err(e) => {
                 let progress = crate::error::PartialProgress {
+                    claim: Some(claim),
                     step_index: i,
                     trace,
                 };
@@ -1243,6 +1310,23 @@ async fn execute_steps(
         let timeout_secs = step
             .timeout_secs
             .unwrap_or(engine.config.default_timeout_secs);
+        // Recheck after condition/template evaluation, immediately before dispatch.
+        if !matches!(
+            engine
+                .db
+                .renew_workflow_execution(community_id, run_id, claim)
+                .await,
+            Ok(true)
+        ) {
+            return Err((
+                WorkflowError::ExecutionOwnershipLost,
+                crate::error::PartialProgress {
+                    step_index: i,
+                    trace,
+                    claim: Some(claim),
+                },
+            ));
+        }
         let dispatch_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             dispatch_action(
@@ -1260,6 +1344,7 @@ async fn execute_steps(
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 let progress = crate::error::PartialProgress {
+                    claim: Some(claim),
                     step_index: i,
                     trace,
                 };
@@ -1267,6 +1352,7 @@ async fn execute_steps(
             }
             Err(_timeout) => {
                 let progress = crate::error::PartialProgress {
+                    claim: Some(claim),
                     step_index: i,
                     trace,
                 };
@@ -1302,12 +1388,14 @@ async fn execute_steps(
                         (
                             e,
                             crate::error::PartialProgress {
+                                claim: Some(claim),
                                 step_index: i,
                                 trace: trace.clone(),
                             },
                         )
                     })?;
                 return Ok(ExecutionResult {
+                    claim: Some(claim),
                     snapshot: Some(snapshot),
                     approval_token: Some(approval_token),
                     step_index: i,
@@ -1327,6 +1415,7 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
+        claim: Some(claim),
         snapshot: None,
         approval_token: None,
         step_index: def.steps.len(),

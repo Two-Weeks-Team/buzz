@@ -1499,6 +1499,92 @@ mod postgres_tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn native_executor_stops_after_execution_lease_loss() {
+        let (db, tenant) = persistence_test_context().await;
+        let community = tenant.community();
+        let owner = Keys::generate().public_key().to_bytes();
+        db.ensure_user(community, &owner).await.unwrap();
+        let (definition,json) = buzz_workflow::WorkflowEngine::parse_yaml(
+            "name: lease-loss\ntrigger:\n  on: message_posted\nsteps:\n  - id: pause\n    action: delay\n    duration: 1s\n  - id: gate\n    action: request_approval\n    from: any\n    message: must not execute after lease loss\n").unwrap();
+        let workflow = db
+            .create_workflow(community, None, &owner, "lease-loss", &json, &[7; 32])
+            .await
+            .unwrap();
+        let run = db
+            .create_workflow_run(
+                community,
+                workflow,
+                None,
+                Some(&serde_json::json!({"original":"preserve"})),
+            )
+            .await
+            .unwrap();
+        let engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            Default::default(),
+        ));
+        let worker = Arc::clone(&engine);
+        let execution = tokio::spawn(async move {
+            buzz_workflow::executor::execute_run(
+                &worker,
+                community,
+                run,
+                &definition,
+                &Default::default(),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if db.get_workflow_run(community, run).await.unwrap().status == RunStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            db.get_workflow_run(community, run).await.unwrap().status,
+            RunStatus::Running
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let pool = sqlx::PgPool::connect(
+            &std::env::var("BUZZ_TEST_DATABASE_URL").expect("explicit test database"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE workflow_runs SET execution_lease_until=clock_timestamp()-interval '1 second' WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid()).bind(run).execute(&pool).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &result,
+            Err((buzz_workflow::WorkflowError::ExecutionOwnershipLost, _))
+        ));
+        engine.finalize_run(community, run, result, None).await;
+        let uncertain: bool = sqlx::query_scalar(
+            "SELECT execution_uncertain FROM workflow_runs WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(uncertain);
+        assert!(db
+            .get_run_approvals(community, workflow, run)
+            .await
+            .unwrap()
+            .is_empty());
+        let preserved = db.get_workflow_run(community, run).await.unwrap();
+        assert_eq!(preserved.status, RunStatus::Running);
+        assert_eq!(
+            preserved.trigger_context,
+            Some(serde_json::json!({"original":"preserve"}))
+        );
+    }
+
     fn rejection_message(result: Result<Option<Vec<u8>>, IngestError>) -> String {
         match result {
             Err(IngestError::Rejected(message)) => message,

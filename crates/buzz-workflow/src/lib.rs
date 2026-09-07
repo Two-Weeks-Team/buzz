@@ -218,9 +218,31 @@ impl WorkflowEngine {
         result: Result<ExecutionResult, (WorkflowError, PartialProgress)>,
         existing_trace: Option<Vec<serde_json::Value>>,
     ) {
-        if matches!(&result, Err((WorkflowError::StartNotClaimed(_), _))) {
+        let claim = match &result {
+            Ok(result) => result.claim,
+            Err((_, progress)) => progress.claim,
+        };
+        let Some(claim) = claim else {
             // A duplicate start is not a failed execution. In particular, do
             // not overwrite the winner's Running/Waiting/Completed record.
+            return;
+        };
+        if matches!(
+            &result,
+            Err((
+                WorkflowError::ExecutionOwnershipLost
+                    | WorkflowError::StepTimeout { .. }
+                    | WorkflowError::WebhookError(_),
+                _
+            ))
+        ) {
+            if let Err(error) = self
+                .db
+                .abandon_workflow_execution(community_id, run_id, claim)
+                .await
+            {
+                tracing::error!(%run_id,"Could not record uncertain execution: {error}");
+            }
             return;
         }
         let prefix = existing_trace.unwrap_or_default();
@@ -241,6 +263,7 @@ impl WorkflowEngine {
                             &token,
                             result.snapshot.as_ref(),
                             &trace_json,
+                            claim,
                         )
                         .await
                     {
@@ -251,25 +274,35 @@ impl WorkflowEngine {
                             run_id = %run_id,
                             "Failed to persist workflow approval gate: {e}"
                         );
+                        let _ = self
+                            .db
+                            .abandon_workflow_execution(community_id, run_id, claim)
+                            .await;
                     }
                 } else {
-                    tracing::info!(run_id = %run_id, "Workflow run completed");
-                    if let Err(e) = self
+                    let finished = self
                         .db
-                        .update_workflow_run(
+                        .finish_workflow_execution(
                             community_id,
                             run_id,
+                            claim,
                             RunStatus::Completed,
                             step_count,
                             &trace_json,
                             None,
                         )
-                        .await
-                    {
+                        .await;
+                    if !matches!(&finished, Ok(true)) {
                         tracing::error!(
                             run_id = %run_id,
-                            "Failed to update run to Completed: {e}"
+                            "Owned completion not confirmed: {finished:?}"
                         );
+                        let _ = self
+                            .db
+                            .abandon_workflow_execution(community_id, run_id, claim)
+                            .await;
+                    } else {
+                        tracing::info!(run_id = %run_id, "Workflow run completed");
                     }
                 }
             }
@@ -278,11 +311,12 @@ impl WorkflowEngine {
                 let mut full_trace = prefix;
                 full_trace.extend(progress.trace);
                 let trace_json = serde_json::Value::Array(full_trace);
-                if let Err(db_err) = self
+                let finished = self
                     .db
-                    .update_workflow_run(
+                    .finish_workflow_execution(
                         community_id,
                         run_id,
+                        claim,
                         RunStatus::Failed,
                         progress.step_index as i32,
                         &trace_json,
@@ -291,12 +325,16 @@ impl WorkflowEngine {
                             message: &e.to_string(),
                         }),
                     )
-                    .await
-                {
+                    .await;
+                if !matches!(&finished, Ok(true)) {
                     tracing::error!(
                         run_id = %run_id,
-                        "Failed to update run to Failed: {db_err}"
+                        "Owned failure result not confirmed: {finished:?}"
                     );
+                    let _ = self
+                        .db
+                        .abandon_workflow_execution(community_id, run_id, claim)
+                        .await;
                 }
             }
         }

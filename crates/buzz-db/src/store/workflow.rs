@@ -812,7 +812,8 @@ pub async fn claim_workflow_start(
     let affected = sqlx::query(
         "UPDATE workflow_runs SET status='running', started_at=COALESCE(started_at,NOW())
          WHERE community_id=$1 AND id=$2 AND status='pending'
-           AND current_step=0 AND execution_trace='[]'::jsonb",
+           AND current_step=0 AND execution_trace='[]'::jsonb
+           AND execution_token IS NULL AND NOT execution_uncertain",
     )
     .bind(community.as_uuid())
     .bind(run)
@@ -967,7 +968,7 @@ pub async fn update_workflow_run(
                                  THEN NOW() ELSE started_at END,
             completed_at  = CASE WHEN $7 IN ('completed','failed','cancelled')
                                  THEN NOW() ELSE completed_at END
-        WHERE community_id = $8 AND id = $9
+        WHERE community_id = $8 AND id = $9 AND execution_token IS NULL
         "#,
     )
     .bind(&status_str)
@@ -1097,6 +1098,16 @@ pub async fn suspend_workflow_run(
     trace: &serde_json::Value,
     execution_context: &serde_json::Value,
 ) -> Result<()> {
+    suspend_workflow_run_inner(pool, approval, trace, execution_context, None).await
+}
+
+async fn suspend_workflow_run_inner(
+    pool: &PgPool,
+    approval: CreateApprovalParams<'_>,
+    trace: &serde_json::Value,
+    execution_context: &serde_json::Value,
+    claim: Option<WorkflowExecutionClaim>,
+) -> Result<()> {
     if !trace.is_array() || !execution_context.is_object() || approval.step_index < 0 {
         return Err(DbError::InvalidData(
             "invalid approval suspension context".into(),
@@ -1105,13 +1116,17 @@ pub async fn suspend_workflow_run(
     let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE workflow_runs SET status='waiting_approval', current_step=$1,
-         execution_trace=$2, trigger_context=jsonb_build_object('buzz_execution_version',1,'snapshot',$3::jsonb)
+         execution_trace=$2, trigger_context=jsonb_build_object('buzz_execution_version',1,'snapshot',$3::jsonb),
+         execution_lease_until=NULL
          WHERE community_id=$4 AND id=$5 AND workflow_id=$6 AND status='running'
-           AND current_step <= $1 AND $7 > clock_timestamp()",
+           AND current_step <= $1 AND $7 > clock_timestamp() AND NOT execution_uncertain
+           AND (($8::uuid IS NULL AND execution_token IS NULL)
+             OR (execution_token=$8 AND execution_epoch=$9 AND execution_lease_until>clock_timestamp()))",
     )
     .bind(approval.step_index).bind(trace).bind(execution_context)
     .bind(approval.community_id.as_uuid()).bind(approval.run_id).bind(approval.workflow_id)
     .bind(approval.expires_at)
+    .bind(claim.map(|c| c.token)).bind(claim.map(|c| c.epoch))
     .execute(&mut *tx).await?.rows_affected();
     if affected != 1 {
         return Err(DbError::AccessDenied(
@@ -1401,6 +1416,30 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Atomically suspend only the exact live execution owner with its gate.
+    pub async fn suspend_owned_workflow_run(
+        &self,
+        approval: CreateApprovalParams<'_>,
+        trace: &serde_json::Value,
+        context: &serde_json::Value,
+        claim: WorkflowExecutionClaim,
+    ) -> Result<()> {
+        suspend_workflow_run_inner(&self.pool, approval, trace, context, Some(claim)).await
+    }
+
+    /// Stop an owned interval conservatively after a transport/ownership loss.
+    /// This does not assert effect failure and must never enable replay.
+    pub async fn abandon_workflow_execution(
+        &self,
+        community: CommunityId,
+        run: Uuid,
+        claim: WorkflowExecutionClaim,
+    ) -> Result<bool> {
+        let changed = sqlx::query("UPDATE workflow_runs SET execution_uncertain=true WHERE community_id=$1 AND id=$2 AND status='running' AND execution_token=$3 AND execution_epoch=$4 AND NOT execution_uncertain")
+            .bind(community.as_uuid()).bind(run).bind(claim.token).bind(claim.epoch)
+            .execute(&self.pool).await?.rows_affected();
+        Ok(changed == 1)
+    }
     /// Claim an initial dispatch or an exactly granted resume and record its
     /// ownership in the same UPDATE. Never reclaim Running or uncertain effects.
     /// `next_step=None` means initial; Some(n) requires a granted gate at n-1.
@@ -1693,6 +1732,7 @@ impl Db {
             "UPDATE workflow_runs r SET status='running', current_step=$3,
              started_at=COALESCE(started_at,NOW())
              WHERE r.community_id=$1 AND r.id=$2 AND r.status='waiting_approval'
+               AND execution_token IS NULL AND NOT execution_uncertain
                AND r.current_step + 1 = $3
                AND EXISTS (SELECT 1 FROM workflow_approvals a
                  WHERE a.community_id=r.community_id AND a.run_id=r.id
@@ -4240,8 +4280,8 @@ mod postgres_tests {
             .await
             .unwrap()
             .unwrap();
-        // Stored gate fixture; the signed decision path is tested separately.
-        update_workflow_run(
+        // Unowned writes must not clobber an owned execution.
+        assert!(update_workflow_run(
             &pool,
             community,
             run,
@@ -4251,14 +4291,55 @@ mod postgres_tests {
             None,
         )
         .await
-        .unwrap();
+        .is_err());
+        let params = || CreateApprovalParams {
+            community_id: community,
+            token: "resume-fixture",
+            workflow_id: workflow,
+            run_id: run,
+            step_id: "gate",
+            step_index: 0,
+            approver_spec: "any",
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        };
+        let trace = serde_json::json!([]);
+        let context = serde_json::json!({"fixture":"gate"});
+        assert!(db
+            .suspend_workflow_run(params(), &trace, &context)
+            .await
+            .is_err());
+        assert!(db
+            .suspend_owned_workflow_run(
+                params(),
+                &trace,
+                &context,
+                WorkflowExecutionClaim {
+                    token: Uuid::new_v4(),
+                    ..first
+                }
+            )
+            .await
+            .is_err());
+        assert!(get_approval(&pool, community, "resume-fixture")
+            .await
+            .is_err());
+        db.suspend_owned_workflow_run(params(), &trace, &context, first)
+            .await
+            .unwrap();
         assert!(db
             .claim_workflow_execution(community, run, Uuid::new_v4(), Some(1))
             .await
             .unwrap()
             .is_none());
-        sqlx::query("INSERT INTO workflow_approvals (community_id,token,workflow_id,run_id,step_id,step_index,approver_spec,status,expires_at) VALUES ($1,$2,$3,$4,'gate',0,'any','granted',NOW()+interval '1 hour')")
-            .bind(community.as_uuid()).bind(hash_approval_token("resume-fixture")).bind(workflow).bind(run).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE workflow_approvals SET status='granted' WHERE community_id=$1 AND token=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(hash_approval_token("resume-fixture"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!db.claim_workflow_resume(community, run, 1).await.unwrap());
         assert!(db
             .claim_workflow_execution(community, run, Uuid::new_v4(), Some(2))
             .await

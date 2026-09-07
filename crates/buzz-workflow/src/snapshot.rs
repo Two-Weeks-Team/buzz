@@ -215,6 +215,7 @@ impl ExecutionSnapshot {
 }
 
 impl crate::WorkflowEngine {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persist_approval_gate(
         &self,
         community: buzz_core::tenant::CommunityId,
@@ -223,6 +224,7 @@ impl crate::WorkflowEngine {
         token: &str,
         snapshot: Option<&ExecutionSnapshot>,
         trace: &serde_json::Value,
+        claim: buzz_db::workflow::WorkflowExecutionClaim,
     ) -> Result<(), WorkflowError> {
         let snapshot = snapshot
             .ok_or_else(|| WorkflowError::InvalidDefinition("missing approval snapshot".into()))?;
@@ -260,7 +262,7 @@ impl crate::WorkflowEngine {
         }));
         let trace = serde_json::Value::Array(trace);
         self.db
-            .suspend_workflow_run(
+            .suspend_owned_workflow_run(
                 buzz_db::workflow::CreateApprovalParams {
                     community_id: community,
                     token,
@@ -273,6 +275,7 @@ impl crate::WorkflowEngine {
                 },
                 &trace,
                 &context,
+                claim,
             )
             .await
             .map_err(|e| WorkflowError::Database(e.to_string()))

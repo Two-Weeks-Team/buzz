@@ -8,6 +8,8 @@ use thiserror::Error;
 /// error, rather than losing it when the in-memory `Vec` is dropped.
 #[derive(Debug, Default)]
 pub struct PartialProgress {
+    /// Exact execution ownership, absent before a successful claim.
+    pub claim: Option<buzz_db::workflow::WorkflowExecutionClaim>,
     /// Index of the step that failed (0-based).
     pub step_index: usize,
     /// Trace entries for steps completed/skipped before the failure.
@@ -55,6 +57,9 @@ pub enum WorkflowError {
     /// Initial execution was not acquired; never finalize another worker's run.
     #[error("start not claimed: {0}")]
     StartNotClaimed(String),
+    /// Execution ownership could not be renewed; outcome may be uncertain.
+    #[error("execution ownership lost")]
+    ExecutionOwnershipLost,
 
     /// A database operation failed.
     #[error("database error: {0}")]
@@ -84,6 +89,7 @@ impl WorkflowError {
             Self::CapacityExceeded => "capacity_exceeded",
             Self::ResumeNotClaimed(_) => "resume_not_claimed",
             Self::StartNotClaimed(_) => "start_not_claimed",
+            Self::ExecutionOwnershipLost => "execution_ownership_lost",
             Self::Database(_) => "database_error",
             Self::Unauthorized(_) => "owner_unauthorized",
             Self::NotImplemented(_) => "action_not_implemented",

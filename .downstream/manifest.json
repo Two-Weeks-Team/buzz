@@ -136,6 +136,14 @@
       "status": "candidate"
     },
     {
+      "id": "workflow-owned-runtime",
+      "summary": "Carry execution claims through heartbeat, step boundaries and atomic owned gate/terminal writes",
+      "paths": ["crates/buzz-db/src/store/workflow.rs", "crates/buzz-workflow/src/error.rs", "crates/buzz-workflow/src/executor.rs", "crates/buzz-workflow/src/lib.rs", "crates/buzz-workflow/src/snapshot.rs", "crates/buzz-relay/src/handlers/command_executor.rs"],
+      "tests": ["cargo test -p buzz-db workflow_execution_resume_rotates_ownership --lib --locked -- --ignored", "cargo test -p buzz-relay native_executor_finalizer_persists_queryable_approval_gate --lib --locked --no-default-features -- --ignored", "cargo test -p buzz-relay native_executor_stops_after_execution_lease_loss --lib --locked --no-default-features -- --ignored"],
+      "upstream_reference": "https://github.com/block/buzz/blob/3c7f288c60d67df78577b237e27c3dfc8831aaa1/crates/buzz-workflow/src/executor.rs",
+      "status": "candidate"
+    },
+    {
       "id": "workflow-execution-ownership",
       "summary": "Add durable token/epoch leases and guarded uncertainty and terminal database primitives",
       "paths": ["migrations/0045_workflow_execution_ownership.sql", "schema/schema.sql", "crates/buzz-db/src/store/workflow.rs"],
