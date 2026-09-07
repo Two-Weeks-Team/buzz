@@ -724,6 +724,10 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         Arc::clone(&workflow_engine),
         state.db.clone(),
     ));
+    tokio::spawn(buzz_relay::workflow_recovery::run_pending(
+        Arc::clone(&workflow_engine),
+        state.db.clone(),
+    ));
 
     // Ephemeral channel reaper — archives channels whose TTL deadline has passed.
     // Runs every 60s, matching the workflow cron loop pattern. The SQL UPDATE

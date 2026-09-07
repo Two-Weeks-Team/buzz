@@ -981,6 +981,17 @@ pub async fn update_workflow_run(
     Ok(())
 }
 
+/// A never-claimed initial dispatch candidate; inventory does not authorize execution.
+#[derive(Debug)]
+pub struct PendingWorkflowStart {
+    /// Stored tenant scope.
+    pub community_id: CommunityId,
+    /// Pending run identifier.
+    pub run_id: Uuid,
+    /// Workflow bound to the run.
+    pub workflow_id: Uuid,
+}
+
 /// A durable granted gate awaiting its single execution claim.
 #[derive(Debug)]
 pub struct GrantedWorkflowResume {
@@ -1373,6 +1384,34 @@ pub async fn find_by_owner_and_name(
 // -- Run and approval Db API --------------------------------------------------
 
 impl Db {
+    /// Host-only bounded keyset inventory. Callers must decode original inputs,
+    /// recheck current authority and acquire the atomic initial claim. Invalid
+    /// snapshots are not filtered here, so paging can advance past legacy rows.
+    pub async fn list_pending_workflow_starts(
+        &self,
+        after: Option<(Uuid, Uuid)>,
+    ) -> Result<Vec<PendingWorkflowStart>> {
+        let rows = sqlx::query(
+            "SELECT community_id,id,workflow_id FROM workflow_runs
+             WHERE status='pending' AND current_step=0 AND execution_trace='[]'::jsonb
+               AND ($1::uuid IS NULL OR (community_id,id)>($1,$2))
+             ORDER BY community_id,id LIMIT 32",
+        )
+        .bind(after.map(|value| value.0))
+        .bind(after.map(|value| value.1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingWorkflowStart {
+                    community_id: CommunityId::from_uuid(row.try_get("community_id")?),
+                    run_id: row.try_get("id")?,
+                    workflow_id: row.try_get("workflow_id")?,
+                })
+            })
+            .collect()
+    }
+
     /// Atomically expire at most 32 overdue pending gates and cancel their exact
     /// waiting runs. Locks approvals first, matching signed decision ordering;
     /// concurrent workers skip locked gates and never overwrite granted tokens.
@@ -3691,6 +3730,70 @@ mod postgres_tests {
         let run = get_workflow_run(&pool, community, committed).await.unwrap();
         assert_eq!(run.status, RunStatus::Pending);
         assert_eq!(run.trigger_context, Some(snapshot));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pending_start_inventory_is_bounded_and_excludes_progress() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community, workflow, Uuid::new_v4(), "pending-page").await;
+        let db = Db::from_pool(pool.clone());
+        let mut expected = Vec::new();
+        for _ in 0..35 {
+            // Legacy rows remain inventory candidates, not executable inputs.
+            expected.push(
+                create_workflow_run(&pool, community, workflow, None, None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for status in [
+            RunStatus::Running,
+            RunStatus::WaitingApproval,
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+            RunStatus::Pending,
+        ] {
+            let run = create_workflow_run(&pool, community, workflow, None, None)
+                .await
+                .unwrap();
+            update_workflow_run(
+                &pool,
+                community,
+                run,
+                status,
+                1,
+                &serde_json::json!([{"step_id":"started"}]),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mut cursor = Some((*community.as_uuid(), Uuid::nil()));
+        let mut found = Vec::new();
+        loop {
+            let rows = db.list_pending_workflow_starts(cursor).await.unwrap();
+            assert!(rows.len() <= 32);
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows
+                .last()
+                .map(|row| (*row.community_id.as_uuid(), row.run_id));
+            for row in rows {
+                if row.community_id == community {
+                    found.push(row.run_id);
+                }
+            }
+            if cursor.unwrap().0 != *community.as_uuid() {
+                break;
+            }
+        }
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     // -- SEC-006: disable-on-membership-loss primitive -------------------------
